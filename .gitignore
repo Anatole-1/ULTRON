@@ -1,0 +1,24 @@
+# === SECRETS — never commit these ===
+.env
+*.key
+*.pem
+id_rsa*
+*_token*
+*secret*
+
+# === Python ===
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+*.egg-info/
+
+# === Generated files (logs, reports) ===
+*.log
+reports/
+output/
+
+# === System ===
+.DS_Store
+Thumbs.db
