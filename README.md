@@ -15,12 +15,9 @@ A scope guardrail sits at the core of the architecture: the agent refuses to act
 on any target that is not listed in a declared rules-of-engagement file. This
 check is hard-coded into the agent's tools.
 
-Testing a system without authorization is illegal (in France, Article 323 of the
-Penal Code). This repository must never be used against a third-party system.
-
 ## Goal
 
-Build an autonomous agent (not a chatbot): you launch it with a target and a
+Build an autonomous agent: you launch it with a target and a
 scope, and it runs the whole mission on its own.
 
 ```bash
@@ -85,4 +82,4 @@ frameworks (AutoGPT / CrewAI) adapted for pentesting.
 
 ## License
 
-Personal study project. (License to be defined.)
+Personal study project.
