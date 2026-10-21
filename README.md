@@ -53,6 +53,15 @@ The project deliberately separates the brain from the hands across two machines:
                                                          [ target ]  (isolated lab)
 ```
 
+The server address is never hard-coded: the orchestrator reads it from the
+`OLLAMA_HOST` environment variable, so no infrastructure detail lives in the
+repository.
+
+```bash
+export OLLAMA_HOST="http://<ai-server-ip>:11434"
+python3 test_connection.py
+```
+
 ## Tech stack
 
 - Language: Python
@@ -63,13 +72,22 @@ The project deliberately separates the brain from the hands across two machines:
 Starting fully local (free, self-contained), with a planned comparison between
 model sizes (local 8B vs. larger cloud models).
 
+## Repository layout
+
+| File | Purpose |
+|------|---------|
+| `test_connection.py` | Minimal connectivity test: sends one prompt to the LLM and prints the answer (the brain <-> hands pipe). |
+| `scope.py` | Scope verification module — the central safeguard. Decides whether a target is in the declared scope. |
+| `scope.txt` | Rules of engagement: the list of allowed targets (one IP or CIDR range per line). Example file, edited per engagement. |
+
 ## Roadmap
 
 - [x] AI server up and running (Ubuntu + GPU driver + Ollama)
 - [x] First model downloaded and tested (`qwen2.5:7b`)
-- [ ] Expose the LLM API on the local network (remote control)
-- [ ] Harden the server (SSH key, firewall, fail2ban)
-- [ ] Minimal script: orchestrator <-> LLM API dialogue
+- [x] Expose the LLM API on the local network (remote control)
+- [x] Harden the server (SSH key, firewall, fail2ban)
+- [x] Minimal script: orchestrator <-> LLM API dialogue
+- [x] Scope guardrail: refuse any out-of-scope target
 - [ ] First tool wired in: run `nmap` against an in-scope target
 - [ ] Full agentic loop with scope enforcement
 - [ ] Findings report generation
