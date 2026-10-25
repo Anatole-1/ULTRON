@@ -11,87 +11,91 @@ AI. It is meant to run **only** against:
 - vulnerable virtual machines set up locally (isolated lab), or
 - targets for which explicit written authorization has been obtained.
 
-A scope guardrail sits at the core of the architecture: the agent refuses to act
-on any target that is not listed in a declared rules-of-engagement file. This
-check is hard-coded into the agent's tools.
+A scope guardrail is hard-coded into the tools: any target not listed in the
+declared rules-of-engagement file is refused, even in autonomous mode.
 
-## Goal
+## How it works
 
-Build an autonomous agent: you launch it with a target and a
-scope, and it runs the whole mission on its own.
+Launch the agent against an authorized target. A local LLM decides each action,
+an orchestrator executes it through scope-enforced tools, and the loop repeats
+until a findings report.
 
 ```bash
-python agent.py --target 192.168.56.50 --scope scope.txt
+python3 agent.py 192.168.56.50
 ```
 
-It runs in an agentic loop (ReAct pattern):
-
-```
-observe -> reason -> act -> repeat
-```
-
-... until it produces a findings report.
-
-Mission flow: reconnaissance -> vulnerability identification -> simple
-exploitation attempts -> report.
+ReAct loop: observe -> reason -> act -> repeat.
 
 ## Architecture
 
-The project deliberately separates the brain from the hands across two machines:
+The project separates the brain from the hands across two machines:
 
 | Role | Machine | Function |
 |------|---------|----------|
-| Brain | AI server (headless) | Runs the LLM. Takes a state, returns the next action to perform. Never touches the target. |
-| Hands | Control host (Kali Linux) | Python orchestrator + pentest tools. Checks the scope, runs the tools, sends results back to the brain. |
+| Brain | AI server (headless) | Runs the LLM via Ollama. Returns the next action. Never touches the target. |
+| Hands | Control host (Kali) | Python orchestrator + tools. Checks scope, runs tools, returns results to the brain. |
 
-```
-   [ Brain: LLM ]  <--- state / decisions --->  [ Hands: orchestrator + tools ]
-       (Ollama)                                     (Python, nmap, ...)
-                                                             |
-                                                        scope check
-                                                             |
-                                                         [ target ]  (isolated lab)
-```
+The server URL is never hard-coded: it is read from `--host` or the
+`OLLAMA_HOST` environment variable.
 
-The server address is never hard-coded: the orchestrator reads it from the
-`OLLAMA_HOST` environment variable, so no infrastructure detail lives in the
-repository.
+## Requirements
+
+- Python 3
+- `nmap` installed and on PATH
+- A reachable Ollama server running a model (default `qwen2.5:7b`)
+
+## Installation
 
 ```bash
-export OLLAMA_HOST="http://<ai-server-ip>:11434"
-python3 test_connection.py
+git clone https://github.com/Anatole-1/ia-pentest-autonome.git
+cd ia-pentest-autonome
+pip install -r requirements.txt
+cp scope.txt.example scope.txt      # then edit scope.txt with your authorized targets
 ```
 
-## Tech stack
+## Usage
 
-- Language: Python
-- Local LLM: [Ollama](https://ollama.com/) — model tested: `qwen2.5:7b`
-- AI server: Ubuntu Server 24.04 LTS, NVIDIA RTX 4060 GPU (8 GB VRAM)
-- Pentest tools: nmap (more added progressively)
+```bash
+export OLLAMA_HOST="http://<your-ollama-host>:11434"
 
-Starting fully local (free, self-contained), with a planned comparison between
-model sizes (local 8B vs. larger cloud models).
+python3 agent.py <target-ip>
+python3 agent.py <target-ip> --scope scope.txt --model qwen2.5:7b --max-steps 6
+python3 agent.py --help
+```
+
+The target must be listed in the scope file, otherwise the scan is refused.
 
 ## Repository layout
 
 | File | Purpose |
 |------|---------|
-| `test_connection.py` | Minimal connectivity test: sends one prompt to the LLM and prints the answer (the brain <-> hands pipe). |
-| `scope.py` | Scope verification module — the central safeguard. Decides whether a target is in the declared scope. |
-| `scope.txt` | Rules of engagement: the list of allowed targets (one IP or CIDR range per line). Example file, edited per engagement. |
+| `agent.py` | CLI + ReAct loop: the LLM decides, the orchestrator executes with scope enforcement. |
+| `nmap_tool.py` | nmap reconnaissance tool; refuses out-of-scope targets. |
+| `scope.py` | Scope verification (single IP and CIDR ranges). |
+| `scope.txt.example` | Rules-of-engagement template; copy to `scope.txt`. |
+| `requirements.txt` | Python dependencies. |
+
+> `scope.txt` is gitignored — it holds real engagement targets and stays local.
+
+## Tech stack
+
+- Language: Python (argparse CLI)
+- Local LLM: [Ollama](https://ollama.com/) — model tested: `qwen2.5:7b`
+- Pentest tools: nmap (more added progressively)
+
+Starting fully local, with a planned comparison between model sizes.
 
 ## Roadmap
 
 - [x] AI server up and running (Ubuntu + GPU driver + Ollama)
-- [x] First model downloaded and tested (`qwen2.5:7b`)
-- [x] Expose the LLM API on the local network (remote control)
-- [x] Harden the server (SSH key, firewall, fail2ban)
-- [x] Minimal script: orchestrator <-> LLM API dialogue
+- [x] Expose the LLM API on the LAN; harden the server (SSH key, firewall, fail2ban)
+- [x] Remote access over a private mesh (Tailscale)
 - [x] Scope guardrail: refuse any out-of-scope target
-- [ ] First tool wired in: run `nmap` against an in-scope target
-- [ ] Full agentic loop with scope enforcement
-- [ ] Findings report generation
-- [ ] Vulnerable-VM lab for training
+- [x] nmap reconnaissance tool
+- [x] Autonomous ReAct loop (LLM drives) with a structured report
+- [ ] Additional tools (targeted service enumeration)
+- [ ] Findings report written to a dated file
+- [ ] Broader lab targets (DVWA, VulnHub, TryHackMe/HTB)
 
 ## Inspirations
 
