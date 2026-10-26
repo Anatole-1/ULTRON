@@ -14,29 +14,41 @@ AI. It is meant to run **only** against:
 A scope guardrail is hard-coded into the tools: any target not listed in the
 declared rules-of-engagement file is refused, even in autonomous mode.
 
-## How it works
-
-Launch the agent against an authorized target. A local LLM decides each action,
-an orchestrator executes it through scope-enforced tools, and the loop repeats
-until a findings report.
+## Quickstart
 
 ```bash
-python3 agent.py 192.168.56.50
+# 1. Get the code and install dependencies
+git clone https://github.com/Anatole-1/ia-pentest-autonome.git
+cd ia-pentest-autonome
+pip install -r requirements.txt
+
+# 2. Declare your authorized target(s)
+cp scope.txt.example scope.txt
+# edit scope.txt: one allowed IP or CIDR range per line
+
+# 3. Run a mission (point --host at your Ollama server)
+python3 agent.py <target-ip> --host http://<ollama-server>:11434
 ```
+
+On startup the agent checks its prerequisites (nmap, the scope file, and that the
+Ollama server is reachable) and prints a clear message if something is missing.
+
+## How it works
+
+A local LLM decides each action, an orchestrator runs it through scope-enforced
+tools, and the loop repeats until a findings report.
 
 ReAct loop: observe -> reason -> act -> repeat.
 
 ## Architecture
-
-The project separates the brain from the hands across two machines:
 
 | Role | Machine | Function |
 |------|---------|----------|
 | Brain | AI server (headless) | Runs the LLM via Ollama. Returns the next action. Never touches the target. |
 | Hands | Control host (Kali) | Python orchestrator + tools. Checks scope, runs tools, returns results to the brain. |
 
-The server URL is never hard-coded: it is read from `--host` or the
-`OLLAMA_HOST` environment variable.
+The server URL is read from `--host` or the `OLLAMA_HOST` environment variable,
+so no infrastructure detail is hard-coded.
 
 ## Requirements
 
@@ -44,26 +56,16 @@ The server URL is never hard-coded: it is read from `--host` or the
 - `nmap` installed and on PATH
 - A reachable Ollama server running a model (default `qwen2.5:7b`)
 
-## Installation
-
-```bash
-git clone https://github.com/Anatole-1/ia-pentest-autonome.git
-cd ia-pentest-autonome
-pip install -r requirements.txt
-cp scope.txt.example scope.txt      # then edit scope.txt with your authorized targets
-```
-
 ## Usage
 
 ```bash
-export OLLAMA_HOST="http://<your-ollama-host>:11434"
-
-python3 agent.py <target-ip>
+python3 agent.py <target-ip> --host http://<ollama-server>:11434
 python3 agent.py <target-ip> --scope scope.txt --model qwen2.5:7b --max-steps 6
 python3 agent.py --help
 ```
 
 The target must be listed in the scope file, otherwise the scan is refused.
+Instead of `--host` you can export `OLLAMA_HOST` once per shell.
 
 ## Repository layout
 
@@ -74,16 +76,15 @@ The target must be listed in the scope file, otherwise the scan is refused.
 | `scope.py` | Scope verification (single IP and CIDR ranges). |
 | `scope.txt.example` | Rules-of-engagement template; copy to `scope.txt`. |
 | `requirements.txt` | Python dependencies. |
+| `BENCHMARK.md` | Model comparison and the chosen model. |
 
 > `scope.txt` is gitignored — it holds real engagement targets and stays local.
 
 ## Tech stack
 
 - Language: Python (argparse CLI)
-- Local LLM: [Ollama](https://ollama.com/) — model tested: `qwen2.5:7b`
+- Local LLM: [Ollama](https://ollama.com/) — model used: `qwen2.5:7b`
 - Pentest tools: nmap (more added progressively)
-
-Starting fully local, with a planned comparison between model sizes.
 
 ## Roadmap
 
@@ -93,6 +94,8 @@ Starting fully local, with a planned comparison between model sizes.
 - [x] Scope guardrail: refuse any out-of-scope target
 - [x] nmap reconnaissance tool
 - [x] Autonomous ReAct loop (LLM drives) with a structured report
+- [x] Model benchmark
+- [x] Startup preflight checks
 - [ ] Additional tools (targeted service enumeration)
 - [ ] Findings report written to a dated file
 - [ ] Broader lab targets (DVWA, VulnHub, TryHackMe/HTB)
