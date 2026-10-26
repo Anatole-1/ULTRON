@@ -35,14 +35,28 @@ Rules:
   Next steps: <concrete follow-up actions>"""
 
 
+def as_text(value):
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return json.dumps(value, ensure_ascii=False)
+
+
 def ask_llm(host, model, messages):
-    resp = requests.post(
-        f"{host}/api/chat",
-        json={"model": model, "messages": messages, "stream": False, "format": "json"},
-        timeout=180,
-    )
-    resp.raise_for_status()
-    return json.loads(resp.json()["message"]["content"])
+    try:
+        resp = requests.post(
+            f"{host}/api/chat",
+            json={"model": model, "messages": messages, "stream": False, "format": "json"},
+            timeout=180,
+        )
+        resp.raise_for_status()
+        data = json.loads(resp.json()["message"]["content"])
+    except requests.exceptions.RequestException as e:
+        return {"action": "error", "thought": f"cannot reach the model server: {e}"}
+    except (json.JSONDecodeError, KeyError):
+        return {"action": "error", "thought": "model returned invalid JSON"}
+    return data if isinstance(data, dict) else {"action": "error", "thought": "model returned non-object JSON"}
 
 
 def run_mission(host, model, scope_file, target, max_steps):
@@ -56,11 +70,11 @@ def run_mission(host, model, scope_file, target, max_steps):
     for step in range(1, max_steps + 1):
         action = ask_llm(host, model, messages)
         messages.append({"role": "assistant", "content": json.dumps(action)})
-        print(f"\n[{step}] {action.get('thought', '').strip()}")
+        print(f"\n[{step}] {as_text(action.get('thought'))}")
 
         kind = action.get("action")
         if kind == "nmap":
-            scan_target = action.get("target", "")
+            scan_target = as_text(action.get("target"))
             if ("nmap", scan_target) in done:
                 print(f"    > skip (already scanned {scan_target})")
                 messages.append({"role": "user", "content":
@@ -69,17 +83,21 @@ def run_mission(host, model, scope_file, target, max_steps):
             print(f"    > nmap {scan_target}")
             output = run_nmap(scan_target, scope_file)
             if output is None:
-                observation = f"REFUSED: {scan_target} is out of scope."
+                observation = f"REFUSED or invalid: {scan_target} is not in scope."
             else:
                 observation = output
                 done.add(("nmap", scan_target))
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
         elif kind == "finish":
+            report = as_text(action.get("report"))
             print("\n=== REPORT ===")
-            print(action.get("report", "").strip())
+            print(report if report else "[!] model returned an empty report")
+            return
+        elif kind == "error":
+            print(f"[!] {as_text(action.get('thought'))}", file=sys.stderr)
             return
         else:
-            print(f"[!] unknown action: {kind}", file=sys.stderr)
+            print(f"[!] unexpected action from model: {kind}", file=sys.stderr)
             return
 
     print("\n[!] max steps reached without a final report", file=sys.stderr)
