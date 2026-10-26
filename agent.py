@@ -7,6 +7,7 @@ scope-enforced tools and feeds the result back, until a final report.
 import argparse
 import json
 import os
+import shutil
 import sys
 
 import requests
@@ -57,6 +58,19 @@ def ask_llm(host, model, messages):
     except (json.JSONDecodeError, KeyError):
         return {"action": "error", "thought": "model returned invalid JSON"}
     return data if isinstance(data, dict) else {"action": "error", "thought": "model returned non-object JSON"}
+
+
+def preflight(host, scope_file):
+    problems = []
+    if shutil.which("nmap") is None:
+        problems.append("nmap is not installed or not on PATH.")
+    if not os.path.exists(scope_file):
+        problems.append(f"scope file not found: {scope_file} (copy scope.txt.example to scope.txt).")
+    try:
+        requests.get(f"{host}/api/tags", timeout=5).raise_for_status()
+    except requests.exceptions.RequestException:
+        problems.append(f"cannot reach the Ollama server at {host} (is it running?).")
+    return problems
 
 
 def run_mission(host, model, scope_file, target, max_steps):
@@ -117,6 +131,12 @@ def main():
     parser.add_argument("-m", "--model", default="qwen2.5:7b", help="model name")
     parser.add_argument("--max-steps", type=int, default=6, help="max reasoning steps")
     args = parser.parse_args()
+
+    problems = preflight(args.host, args.scope)
+    if problems:
+        for p in problems:
+            print(f"[!] {p}", file=sys.stderr)
+        sys.exit(1)
 
     run_mission(args.host, args.model, args.scope, args.target, args.max_steps)
 
