@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sys
+from datetime import datetime
 
 import requests
 
@@ -57,6 +58,24 @@ def parse_services(nmap_output):
         if re.match(r"^\d+/tcp\s+open", line.strip()):
             services.append(" ".join(line.split()))
     return services
+
+
+def build_report(target, services, findings):
+    service_lines = "\n".join(f"- {s}" for s in services) if services else "- (no nmap scan completed)"
+    return (
+        f"# Pentest report - {target}\n\n"
+        f"_Generated {datetime.now():%Y-%m-%d %H:%M}_\n\n"
+        f"## Open services\n{service_lines}\n\n"
+        f"## Analysis\n{findings if findings else '(model returned an empty report)'}\n"
+    )
+
+
+def save_report(target, report, directory="reports"):
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{target}_{datetime.now():%Y-%m-%d_%H%M%S}.md")
+    with open(path, "w") as f:
+        f.write(report)
+    return path
 
 
 def ask_llm(host, model, messages):
@@ -139,12 +158,11 @@ def run_mission(host, model, scope_file, target, max_steps):
                 observation = f"REFUSED or invalid: {scan_target}:{port}."
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
         elif kind == "finish":
-            report = as_text(action.get("report"))
+            findings = as_text(action.get("report"))
             services = parse_services(last_scan) if last_scan else []
-            print("\n=== REPORT ===")
-            print(f"Target: {target}")
-            print("Open services: " + (", ".join(services) if services else "(no nmap scan completed)"))
-            print(report if report else "[!] model returned an empty report")
+            report = build_report(target, services, findings)
+            print("\n" + report)
+            print(f"[*] report saved to {save_report(target, report)}")
             return
         elif kind == "error":
             print(f"[!] {as_text(action.get('thought'))}", file=sys.stderr)
