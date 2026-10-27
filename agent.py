@@ -16,7 +16,8 @@ import requests
 
 from nmap_tool import run_nmap
 from enum_tool import run_enum
-from exploit_tool import run_exploit, MODULES
+from exploit_tool import MODULES
+from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS
 
 
 def build_prompt(exploit_enabled):
@@ -32,7 +33,8 @@ def build_prompt(exploit_enabled):
         fields = fields.replace('"finish"', '"exploit"|"finish"') + ', "module": "<module key>"'
         exploit_rule = ("- When a scan shows a service matching an allowed exploit module, use "
                         "'exploit' with that module key to confirm the vulnerability.\n"
-                        "- If an exploit returns no session, try a different allowed module before giving up.\n")
+                        "- If an exploit returns no session, try a different allowed module before giving up.\n"
+                        "- A successful exploit automatically collects read-only impact evidence; once it succeeds, finish.\n")
     fields += ', "report": "<findings>"'
     tool_list = "\n".join(tools)
     return (
@@ -85,7 +87,18 @@ def exploit_result(output):
     return "no session"
 
 
-def build_report(target, services, exploits, findings):
+def build_postexploit_section(collected):
+    if not collected:
+        return "_(no post-exploitation performed)_"
+    blocks = []
+    for label, cmd in POST_COMMANDS.items():
+        body = collected.get(label)
+        if body:
+            blocks.append(f"### {label} — `{cmd}`\n```\n{body}\n```")
+    return "\n\n".join(blocks) if blocks else "_(no data collected)_"
+
+
+def build_report(target, services, exploits, postexploit, findings):
     service_lines = "\n".join(f"- {s}" for s in services) if services else "- (no nmap scan completed)"
     exploit_lines = "\n".join(f"- {e}" for e in exploits) if exploits else "- (none attempted)"
     return (
@@ -93,6 +106,7 @@ def build_report(target, services, exploits, findings):
         f"_Generated {datetime.now():%Y-%m-%d %H:%M}_\n\n"
         f"## Open services\n{service_lines}\n\n"
         f"## Exploitation\n{exploit_lines}\n\n"
+        f"## Post-exploitation\n{build_postexploit_section(postexploit)}\n\n"
         f"## Analysis\n{findings if findings else '(model returned an empty report)'}\n"
     )
 
@@ -135,6 +149,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
     done = set()
     last_scan = None
     exploits = []
+    postexploit = {}
 
     for step in range(1, max_steps + 1):
         action = ask_llm(host, model, messages)
@@ -189,26 +204,31 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
                     f"Already tried {module_key} on {scan_target}. Use the result or finish."})
                 continue
             print(f"    > exploit {module_key} on {scan_target}")
-            output = run_exploit(scan_target, module_key, scope_file)
+            output = run_postexploit(scan_target, module_key, scope_file)
             if output is None:
                 observation = f"REFUSED or unknown module/target: {module_key} on {scan_target}."
             else:
                 done.add(("exploit", scan_target, module_key))
                 outcome = exploit_result(output)
                 exploits.append(f"{module_key} on {scan_target} -> {outcome}")
-                observation = truncate(output)
                 if outcome == "no session":
+                    observation = f"{module_key}: no shell obtained."
                     tried = {e[2] for e in done if e[0] == "exploit"}
                     remaining = [k for k in MODULES if k not in tried]
                     if remaining:
-                        observation += ("\n\n[note] No shell obtained with this module. "
-                                        f"Untried exploit modules: {', '.join(remaining)}. "
+                        observation += (f" Untried exploit modules: {', '.join(remaining)}. "
                                         "Try one that matches an open service before finishing.")
+                else:
+                    collected = parse_collection(output)
+                    postexploit.update(collected)
+                    labels = ", ".join(k for k in POST_COMMANDS if collected.get(k))
+                    observation = (f"{module_key}: {outcome}. Read-only post-exploitation collected "
+                                   f"({labels}) and recorded for the report. Impact is documented; you may finish.")
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
         elif kind == "finish":
             findings = as_text(action.get("report"))
             services = parse_services(last_scan) if last_scan else []
-            report = build_report(target, services, exploits, findings)
+            report = build_report(target, services, exploits, postexploit, findings)
             print("\n" + report)
             print(f"[*] report saved to {save_report(target, report)}")
             return
