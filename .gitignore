@@ -19,9 +19,9 @@ env/
 reports/
 output/
 
+# === Scope (rules of engagement) — local only ===
+scope.txt
+
 # === System ===
 .DS_Store
 Thumbs.db
-scope.txt
-reports/
-reports/
