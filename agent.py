@@ -40,6 +40,10 @@ TOOLS = {
 
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 
+# Minimum distinct services the agent must enumerate before it may conclude,
+# unless a shell was already obtained or every open port is already enumerated.
+MIN_ENUM_BEFORE_FINISH = 3
+
 
 def scrub_unverified_cves(text, corpus):
     """Drop any CVE id the model wrote that never appeared in what the agent
@@ -49,6 +53,15 @@ def scrub_unverified_cves(text, corpus):
         lambda m: m.group(0) if m.group(0).upper() in corpus_up else "[unverified CVE removed]",
         text,
     )
+
+
+def scan_ports(nmap_output):
+    ports = []
+    for line in nmap_output.splitlines():
+        m = re.match(r"^(\d+)/tcp\s+open", line.strip())
+        if m:
+            ports.append(m.group(1))
+    return ports
 
 
 def build_prompt(exploit_enabled):
@@ -88,6 +101,7 @@ def build_prompt(exploit_enabled):
         "Rules:\n"
         f"- The 'action' field must be EXACTLY one keyword ({keywords}). Never put a sentence there.\n"
         "- Start with nmap. Then use enum on the most interesting or outdated service.\n"
+        "- Enumerate SEVERAL interesting services before finishing; do not conclude after a single enum.\n"
         f"{exploit_rule}"
         "- Base every statement strictly on the observations returned to you. Never invent a port, service, version, or result.\n"
         "- Do not cite a CVE number unless it appears verbatim in an observation.\n"
@@ -280,6 +294,17 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
                                    f"({labels}) and recorded for the report. Impact is documented; you may finish.")
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
         elif kind == "finish":
+            enum_ports = {e[2] for e in done if e[0] == "enum"}
+            shell = any("shell opened" in e for e in exploits)
+            open_ports = scan_ports(last_scan) if last_scan else []
+            not_enumed = [p for p in open_ports if p not in enum_ports]
+            if not shell and len(enum_ports) < MIN_ENUM_BEFORE_FINISH and not_enumed:
+                print(f"    > finish blocked ({len(enum_ports)}/{MIN_ENUM_BEFORE_FINISH} services enumerated)")
+                messages.append({"role": "user", "content":
+                    f"Not enough reconnaissance to conclude: {len(enum_ports)} service(s) enumerated, "
+                    f"aim for at least {MIN_ENUM_BEFORE_FINISH}. Open ports not yet enumerated: "
+                    f"{', '.join(not_enumed[:8])}. Use enum on one of them (or exploit) before finishing."})
+                continue
             corpus = "\n".join(seen)
             findings = scrub_unverified_cves(as_text(action.get("report")), corpus)
             services = parse_services(last_scan) if last_scan else []
