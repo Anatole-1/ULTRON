@@ -38,6 +38,18 @@ TOOLS = {
     },
 }
 
+_CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+
+
+def scrub_unverified_cves(text, corpus):
+    """Drop any CVE id the model wrote that never appeared in what the agent
+    actually observed. The orchestrator stays the source of truth for facts."""
+    corpus_up = corpus.upper()
+    return _CVE_RE.sub(
+        lambda m: m.group(0) if m.group(0).upper() in corpus_up else "[unverified CVE removed]",
+        text,
+    )
+
 
 def build_prompt(exploit_enabled):
     tool_lines = [f"- {name}: {meta['desc']}" for name, meta in TOOLS.items()]
@@ -60,6 +72,7 @@ def build_prompt(exploit_enabled):
         fields += ', "module": "<module key>"'
         exploit_rule = ("- When a scan shows a service matching an allowed exploit module, use "
                         "'exploit' with that module key to confirm the vulnerability.\n"
+                        "- The module value must be an EXACT allowed module key; never invent one.\n"
                         "- If an exploit returns no session, try a different allowed module before giving up.\n"
                         "- A successful exploit automatically collects read-only impact evidence; once it succeeds, finish.\n")
     fields += ', "report": "<findings>"'
@@ -212,6 +225,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
     last_scan = None
     exploits = []
     postexploit = {}
+    seen = []
 
     for step in range(1, max_steps + 1):
         action = ask_llm(host, model, messages)
@@ -221,8 +235,10 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
         kind = action.get("action")
         if kind in TOOLS:
             output = run_tool(kind, action, scope_file, done, messages)
-            if output is not None and TOOLS[kind].get("is_scan"):
-                last_scan = output
+            if output is not None:
+                seen.append(output)
+                if TOOLS[kind].get("is_scan"):
+                    last_scan = output
         elif kind == "exploit":
             scan_target = as_text(action.get("target"))
             module_key = as_text(action.get("module"))
@@ -237,9 +253,16 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
             print(f"    > exploit {module_key} on {scan_target}")
             output = run_postexploit(scan_target, module_key, scope_file)
             if output is None:
-                observation = f"REFUSED or unknown module/target: {module_key} on {scan_target}."
+                if module_key not in MODULES:
+                    tried = {e[2] for e in done if e[0] == "exploit"}
+                    choices = [k for k in MODULES if k not in tried] or list(MODULES)
+                    observation = (f"Unknown module '{module_key}'. Use an EXACT allowed module key: "
+                                   f"{', '.join(choices)}. Pick one matching an open service, or finish.")
+                else:
+                    observation = f"REFUSED: {scan_target} is not in scope."
             else:
                 done.add(("exploit", scan_target, module_key))
+                seen.append(output)
                 outcome = exploit_result(output)
                 exploits.append(f"{module_key} on {scan_target} -> {outcome}")
                 if outcome == "no session":
@@ -257,7 +280,8 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
                                    f"({labels}) and recorded for the report. Impact is documented; you may finish.")
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
         elif kind == "finish":
-            findings = as_text(action.get("report"))
+            corpus = "\n".join(seen)
+            findings = scrub_unverified_cves(as_text(action.get("report")), corpus)
             services = parse_services(last_scan) if last_scan else []
             report = build_report(target, services, exploits, postexploit, findings)
             print("\n" + report)
