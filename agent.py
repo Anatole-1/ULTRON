@@ -20,23 +20,52 @@ from exploit_tool import MODULES
 from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS
 
 
+# Registry of simple recon/collection tools. Each runs as
+# run(target, *extra_params, scope_file) and returns text or None (refused).
+# Adding a recon tool = one entry here + its function. The prompt and the main
+# loop pick it up automatically; exploitation is handled separately below.
+TOOLS = {
+    "nmap": {
+        "desc": "broad service/version scan of a target IP.",
+        "extra_params": [],
+        "run": run_nmap,
+        "is_scan": True,
+    },
+    "enum": {
+        "desc": "deeper scan of ONE port on the target (runs nmap vulnerability scripts).",
+        "extra_params": ["port"],
+        "run": run_enum,
+    },
+}
+
+
 def build_prompt(exploit_enabled):
-    tools = [
-        "- nmap: broad service/version scan of a target IP.",
-        "- enum: deeper scan of ONE port on the target (runs nmap vulnerability scripts).",
-    ]
-    fields = '"thought": "...", "action": "nmap"|"enum"|"finish", "target": "<ip>", "port": "<port>"'
+    tool_lines = [f"- {name}: {meta['desc']}" for name, meta in TOOLS.items()]
+    action_keywords = list(TOOLS) + (["exploit"] if exploit_enabled else []) + ["finish"]
+    extra_params = []
+    for meta in TOOLS.values():
+        for p in meta["extra_params"]:
+            if p not in extra_params:
+                extra_params.append(p)
+
+    actions = "|".join(f'"{k}"' for k in action_keywords)
+    fields = f'"thought": "...", "action": {actions}, "target": "<ip>"'
+    for p in extra_params:
+        fields += f', "{p}": "<{p}>"'
+
     exploit_rule = ""
     if exploit_enabled:
         modules = ", ".join(f"{k} ({v['desc']})" for k, v in MODULES.items())
-        tools.append(f"- exploit: launch a known exploit module against the target. Allowed modules: {modules}.")
-        fields = fields.replace('"finish"', '"exploit"|"finish"') + ', "module": "<module key>"'
+        tool_lines.append(f"- exploit: launch a known exploit module against the target. Allowed modules: {modules}.")
+        fields += ', "module": "<module key>"'
         exploit_rule = ("- When a scan shows a service matching an allowed exploit module, use "
                         "'exploit' with that module key to confirm the vulnerability.\n"
                         "- If an exploit returns no session, try a different allowed module before giving up.\n"
                         "- A successful exploit automatically collects read-only impact evidence; once it succeeds, finish.\n")
     fields += ', "report": "<findings>"'
-    tool_list = "\n".join(tools)
+
+    tool_list = "\n".join(tool_lines)
+    keywords = ", ".join(action_keywords)
     return (
         "You are an autonomous penetration-testing agent operating in an authorized lab.\n"
         "You choose one action at a time; an external executor runs it and returns the result.\n\n"
@@ -44,7 +73,7 @@ def build_prompt(exploit_enabled):
         "Reply with ONE JSON object and nothing else:\n"
         f"  {{{fields}}}\n\n"
         "Rules:\n"
-        "- The 'action' field must be EXACTLY one keyword (nmap, enum, exploit, finish). Never put a sentence there.\n"
+        f"- The 'action' field must be EXACTLY one keyword ({keywords}). Never put a sentence there.\n"
         "- Start with nmap. Then use enum on the most interesting or outdated service.\n"
         f"{exploit_rule}"
         "- Base every statement strictly on the observations returned to you. Never invent a port, service, version, or result.\n"
@@ -140,6 +169,39 @@ def preflight(host, scope_file):
     return problems
 
 
+def run_tool(kind, action, scope_file, done, messages):
+    """Generic handler for a registry tool. Returns its text output on success
+    (so the caller can remember a scan), or None otherwise."""
+    meta = TOOLS[kind]
+    scan_target = as_text(action.get("target"))
+    extra_values = []
+    for param in meta["extra_params"]:
+        value = as_text(action.get(param))
+        if not value:
+            messages.append({"role": "user", "content": f"Observation: {kind} requires a {param}."})
+            return None
+        extra_values.append(value)
+
+    loc = scan_target + ("".join(f":{v}" for v in extra_values))
+    key = (kind, scan_target, *extra_values)
+    if key in done:
+        print(f"    > skip (already ran {kind} on {loc})")
+        messages.append({"role": "user", "content":
+            f"Already ran {kind} on {loc}. Do not repeat it; use the result or finish."})
+        return None
+
+    print(f"    > {kind} {loc}")
+    output = meta["run"](scan_target, *extra_values, scope_file)
+    if output is None:
+        messages.append({"role": "user", "content":
+            f"Observation:\nREFUSED or invalid: {loc} is not in scope."})
+        return None
+
+    done.add(key)
+    messages.append({"role": "user", "content": f"Observation:\n{truncate(output)}"})
+    return output
+
+
 def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
     print(f"[*] target {target} | brain {model} @ {host}" + (" | exploit ON" if exploit_enabled else ""))
     messages = [
@@ -157,41 +219,10 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
         print(f"\n[{step}] {as_text(action.get('thought'))}")
 
         kind = action.get("action")
-        if kind == "nmap":
-            scan_target = as_text(action.get("target"))
-            if ("nmap", scan_target) in done:
-                print(f"    > skip (already scanned {scan_target})")
-                messages.append({"role": "user", "content":
-                    f"Already scanned {scan_target}. Do not repeat it; use the result or finish."})
-                continue
-            print(f"    > nmap {scan_target}")
-            output = run_nmap(scan_target, scope_file)
-            if output is not None:
-                done.add(("nmap", scan_target))
+        if kind in TOOLS:
+            output = run_tool(kind, action, scope_file, done, messages)
+            if output is not None and TOOLS[kind].get("is_scan"):
                 last_scan = output
-                observation = truncate(output)
-            else:
-                observation = f"REFUSED or invalid: {scan_target} is not in scope."
-            messages.append({"role": "user", "content": f"Observation:\n{observation}"})
-        elif kind == "enum":
-            scan_target = as_text(action.get("target"))
-            port = as_text(action.get("port"))
-            if not port:
-                messages.append({"role": "user", "content": "Observation: enum requires a port."})
-                continue
-            if ("enum", scan_target, port) in done:
-                print(f"    > skip (already enumerated {scan_target}:{port})")
-                messages.append({"role": "user", "content":
-                    f"Already enumerated {scan_target}:{port}. Use the result or finish."})
-                continue
-            print(f"    > enum {scan_target}:{port}")
-            output = run_enum(scan_target, port, scope_file)
-            if output is not None:
-                done.add(("enum", scan_target, port))
-                observation = truncate(output)
-            else:
-                observation = f"REFUSED or invalid: {scan_target}:{port}."
-            messages.append({"role": "user", "content": f"Observation:\n{observation}"})
         elif kind == "exploit":
             scan_target = as_text(action.get("target"))
             module_key = as_text(action.get("module"))
@@ -236,7 +267,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
             print(f"[!] {as_text(action.get('thought'))}", file=sys.stderr)
             return
         else:
-            valid = "nmap, enum, exploit, finish" if exploit_enabled else "nmap, enum, finish"
+            valid = ", ".join(list(TOOLS) + (["exploit"] if exploit_enabled else []) + ["finish"])
             print(f"    > invalid action, re-prompting: {kind}")
             messages.append({"role": "user", "content":
                 f"Invalid action. The 'action' field must be exactly one keyword from: {valid}. "
