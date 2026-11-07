@@ -44,6 +44,23 @@ _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 # unless a shell was already obtained or every open port is already enumerated.
 MIN_ENUM_BEFORE_FINISH = 3
 
+# Consecutive unproductive steps after which the agent asks a human for help
+# (when interactive) or stops cleanly with a note (when unattended).
+STUCK_LIMIT = 3
+
+
+def ask_approval(question):
+    """Returns 'yes', 'no', or 'all' (yes to all for the rest of the run)."""
+    try:
+        answer = input(f"[?] {question} [y/N/a=yes-to-all] ").strip().lower()
+    except EOFError:
+        return "no"
+    if answer in ("a", "all", "tout"):
+        return "all"
+    if answer in ("y", "yes", "o", "oui"):
+        return "yes"
+    return "no"
+
 
 def scrub_unverified_cves(text, corpus):
     """Drop any CVE id the model wrote that never appeared in what the agent
@@ -229,8 +246,10 @@ def run_tool(kind, action, scope_file, done, messages):
     return output
 
 
-def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
-    print(f"[*] target {target} | brain {model} @ {host}" + (" | exploit ON" if exploit_enabled else ""))
+def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, interactive):
+    print(f"[*] target {target} | brain {model} @ {host}"
+          + (" | exploit ON" if exploit_enabled else "")
+          + ("" if interactive else " | non-interactive"))
     messages = [
         {"role": "system", "content": build_prompt(exploit_enabled)},
         {"role": "user", "content": f"Assess target {target}. Decide the first action."},
@@ -240,8 +259,27 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
     exploits = []
     postexploit = {}
     seen = []
+    stuck = 0
+    auto_approve = False
 
     for step in range(1, max_steps + 1):
+        if stuck >= STUCK_LIMIT:
+            if interactive:
+                print(f"[!] Agent stuck after {stuck} unproductive steps.")
+                hint = input("[?] Hint to unblock it (or ENTER to let it finish): ").strip()
+                if hint:
+                    messages.append({"role": "user", "content": f"Human hint: {hint}"})
+                else:
+                    messages.append({"role": "user", "content": "Human: no hint. Conclude with a finish now."})
+                stuck = 0
+            else:
+                services = parse_services(last_scan) if last_scan else []
+                note = "Agent stopped: stuck after repeated unproductive steps; human input needed."
+                report = build_report(target, services, exploits, postexploit, note)
+                print("\n" + report)
+                print(f"[*] report saved to {save_report(target, report)}", file=sys.stderr)
+                return
+
         action = ask_llm(host, model, messages)
         messages.append({"role": "assistant", "content": json.dumps(action)})
         print(f"\n[{step}] {as_text(action.get('thought'))}")
@@ -250,20 +288,33 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
         if kind in TOOLS:
             output = run_tool(kind, action, scope_file, done, messages)
             if output is not None:
+                stuck = 0
                 seen.append(output)
                 if TOOLS[kind].get("is_scan"):
                     last_scan = output
+            else:
+                stuck += 1
         elif kind == "exploit":
             scan_target = as_text(action.get("target"))
             module_key = as_text(action.get("module"))
             if not exploit_enabled:
                 messages.append({"role": "user", "content": "Observation: exploitation is disabled (run with --exploit)."})
+                stuck += 1
                 continue
             if ("exploit", scan_target, module_key) in done:
                 print(f"    > skip (already tried {module_key} on {scan_target})")
                 messages.append({"role": "user", "content":
                     f"Already tried {module_key} on {scan_target}. Use the result or finish."})
+                stuck += 1
                 continue
+            if interactive and not auto_approve and module_key in MODULES:
+                decision = ask_approval(f"Run exploit {module_key} on {scan_target}?")
+                if decision == "all":
+                    auto_approve = True
+                elif decision == "no":
+                    messages.append({"role": "user", "content":
+                        f"Human declined exploit {module_key} on {scan_target}. Choose another action or finish."})
+                    continue
             print(f"    > exploit {module_key} on {scan_target}")
             output = run_postexploit(scan_target, module_key, scope_file)
             if output is None:
@@ -274,6 +325,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
                                    f"{', '.join(choices)}. Pick one matching an open service, or finish.")
                 else:
                     observation = f"REFUSED: {scan_target} is not in scope."
+                stuck += 1
             else:
                 done.add(("exploit", scan_target, module_key))
                 seen.append(output)
@@ -286,12 +338,14 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
                     if remaining:
                         observation += (f" Untried exploit modules: {', '.join(remaining)}. "
                                         "Try one that matches an open service before finishing.")
+                    stuck += 1
                 else:
                     collected = parse_collection(output)
                     postexploit.update(collected)
                     labels = ", ".join(k for k in POST_COMMANDS if collected.get(k))
                     observation = (f"{module_key}: {outcome}. Read-only post-exploitation collected "
                                    f"({labels}) and recorded for the report. Impact is documented; you may finish.")
+                    stuck = 0
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
         elif kind == "finish":
             enum_ports = {e[2] for e in done if e[0] == "enum"}
@@ -304,6 +358,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
                     f"Not enough reconnaissance to conclude: {len(enum_ports)} service(s) enumerated, "
                     f"aim for at least {MIN_ENUM_BEFORE_FINISH}. Open ports not yet enumerated: "
                     f"{', '.join(not_enumed[:8])}. Use enum on one of them (or exploit) before finishing."})
+                stuck += 1
                 continue
             corpus = "\n".join(seen)
             findings = scrub_unverified_cves(as_text(action.get("report")), corpus)
@@ -321,6 +376,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled):
             messages.append({"role": "user", "content":
                 f"Invalid action. The 'action' field must be exactly one keyword from: {valid}. "
                 f"Do not put a sentence there. Reply with one JSON object."})
+            stuck += 1
             continue
 
     print("\n[!] max steps reached without a final report", file=sys.stderr)
@@ -348,6 +404,8 @@ def main():
     parser.add_argument("-m", "--model", default="qwen2.5:7b", help="model name")
     parser.add_argument("--max-steps", type=int, default=8, help="max reasoning steps")
     parser.add_argument("--exploit", action="store_true", help="enable exploitation of known lab vulns (off by default)")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="auto-approve everything; never pause for confirmation or hints")
     args = parser.parse_args()
 
     problems = preflight(args.host, args.scope)
@@ -356,7 +414,8 @@ def main():
             print(f"[!] {p}", file=sys.stderr)
         sys.exit(1)
 
-    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit)
+    interactive = sys.stdin.isatty() and not args.yes
+    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive)
 
 
 if __name__ == "__main__":
