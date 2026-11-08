@@ -18,7 +18,7 @@ import requests
 from nmap_tool import run_nmap
 from enum_tool import run_enum
 from exploit_tool import MODULES
-from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS
+from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS, interactive_exploit
 
 
 # Registry of simple recon/collection tools. Each runs as
@@ -98,14 +98,15 @@ def build_prompt(exploit_enabled):
 
     exploit_rule = ""
     if exploit_enabled:
-        modules = ", ".join(f"{k} ({v['desc']})" for k, v in MODULES.items())
+        modules = ", ".join(f"{k} (for {v['trigger']} - {v['desc']})" for k, v in MODULES.items())
         tool_lines.append(f"- exploit: launch a known exploit module against the target. Allowed modules: {modules}.")
         fields += ', "module": "<module key>"'
-        exploit_rule = ("- When a scan shows a service matching an allowed exploit module, use "
-                        "'exploit' with that module key to confirm the vulnerability.\n"
-                        "- The module value must be an EXACT allowed module key; never invent one.\n"
-                        "- If an exploit returns no session, try a different allowed module before giving up.\n"
-                        "- A successful exploit automatically collects read-only impact evidence; once it succeeds, finish.\n")
+        exploit_rule = ("- As soon as nmap shows a service matching an allowed module (see its 'for ...' tag), "
+                        "use 'exploit' with that EXACT module key BEFORE any further enum.\n"
+                        "- Never 'exploit' a service or CVE that has no allowed module key, and never invent a module key.\n"
+                        "- If an exploit returns no session or an unstable session, immediately try another untried allowed module before concluding.\n"
+                        "- Do not keep enumerating services that have no matching module.\n"
+                        "- A successful exploit automatically collects read-only impact; once it succeeds, finish.\n")
     fields += ', "report": "<findings>"'
 
     tool_list = "\n".join(tool_lines)
@@ -250,7 +251,7 @@ def run_tool(kind, action, scope_file, done, messages):
     return output
 
 
-def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, interactive, think):
+def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, interactive, think, shell_enabled):
     print(f"[*] target {target} | brain {model} @ {host}"
           + (" | exploit ON" if exploit_enabled else "")
           + ("" if interactive else " | non-interactive")
@@ -347,6 +348,9 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
                 else:
                     collected = parse_collection(output)
                     postexploit.update(collected)
+                    if shell_enabled and interactive:
+                        print("    > opening interactive shell on the target (msfconsole); type 'exit' to return...")
+                        interactive_exploit(scan_target, module_key, scope_file)
                     labels = ", ".join(k for k in POST_COMMANDS if collected.get(k))
                     observation = (f"{module_key}: {outcome}. Read-only post-exploitation collected "
                                    f"({labels}) and recorded for the report. Impact is documented; you may finish.")
@@ -413,6 +417,8 @@ def main():
                         help="auto-approve everything; never pause for confirmation or hints")
     parser.add_argument("--think", action="store_true",
                         help="enable the model's internal reasoning (slower; richer thoughts on qwen3)")
+    parser.add_argument("--shell", action="store_true",
+                        help="after a successful exploit, hand an interactive root shell to the human (interactive only)")
     args = parser.parse_args()
 
     problems = preflight(args.host, args.scope)
@@ -423,7 +429,7 @@ def main():
 
     interactive = sys.stdin.isatty() and not args.yes
     start = time.monotonic()
-    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think)
+    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think, args.shell)
     print(f"[*] total time: {time.monotonic() - start:.1f}s")
 
 
