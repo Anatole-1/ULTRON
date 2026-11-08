@@ -182,14 +182,16 @@ def build_postexploit_section(collected):
     return "\n\n".join(blocks) if blocks else "_(no data collected)_"
 
 
-def build_report(target, services, exploits, postexploit, findings):
+def build_report(target, services, exploits, postexploit, findings, credentials=None):
     service_lines = "\n".join(f"- {s}" for s in services) if services else "- (no nmap scan completed)"
     exploit_lines = "\n".join(f"- {e}" for e in exploits) if exploits else "- (none attempted)"
+    cred_lines = "\n".join(f"- {c}" for c in credentials) if credentials else "- (none found)"
     return (
         f"# Pentest report - {target}\n\n"
         f"_Generated {datetime.now():%Y-%m-%d %H:%M}_\n\n"
         f"## Open services\n{service_lines}\n\n"
         f"## Exploitation\n{exploit_lines}\n\n"
+        f"## Credentials\n{cred_lines}\n\n"
         f"## Post-exploitation\n{build_postexploit_section(postexploit)}\n\n"
         f"## Analysis\n{findings if findings else '(model returned an empty report)'}\n"
     )
@@ -227,11 +229,11 @@ def preflight(host, scope_file):
     return problems
 
 
-def run_tool(kind, action, scope_file, done, messages):
+def run_tool(kind, action, target, scope_file, done, messages):
     """Generic handler for a registry tool. Returns its text output on success
     (so the caller can remember a scan), or None otherwise."""
     meta = TOOLS[kind]
-    scan_target = as_text(action.get("target"))
+    scan_target = target
     extra_values = []
     for param in meta["extra_params"]:
         value = as_text(action.get(param))
@@ -260,7 +262,70 @@ def run_tool(kind, action, scope_file, done, messages):
     return output
 
 
-def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, interactive, think, shell_enabled):
+def extract_credentials(output):
+    creds = []
+    for line in output.splitlines():
+        m = re.search(r"\[(\d+)\]\[(\w+)\].*login:\s*(\S+)\s+password:\s*(\S+)", line)
+        if m:
+            creds.append(f"{m.group(2)} {m.group(3)} / {m.group(4)}")
+    return creds
+
+
+def describe_action(action, target):
+    kind = as_text(action.get("action"))
+    if kind == "exploit":
+        return f"exploit {as_text(action.get('module')) or '?'} on {target}"
+    if kind == "finish":
+        return "finish (write the report)"
+    if kind in TOOLS:
+        extras = " ".join(as_text(action.get(p)) for p in TOOLS[kind]["extra_params"])
+        return f"{kind} {target} {extras}".strip()
+    return kind or "(unclear)"
+
+
+def parse_human_action(text, target):
+    parts = text.split()
+    if not parts:
+        return None
+    kind = parts[0].lower()
+    rest = parts[1:]
+    if kind in TOOLS:
+        action = {"action": kind, "target": target}
+        for i, p in enumerate(TOOLS[kind]["extra_params"]):
+            if i < len(rest):
+                action[p] = rest[i]
+        return action
+    if kind == "exploit":
+        action = {"action": "exploit", "target": target}
+        if rest:
+            action["module"] = rest[0]
+        return action
+    if kind == "finish":
+        return {"action": "finish", "report": "Session ended by the operator."}
+    return None
+
+
+def guided_choice(action, target):
+    """Show the model's proposed action; let the human accept it (ENTER), type a
+    replacement action, or quit (q). Returns the action dict, or None to quit."""
+    print(f"[proposed] {describe_action(action, target)}")
+    hint = "[ENTER]=accept | type an action to change it (e.g. 'hydra ftp', 'exploit samba_usermap_script', 'enum 445', 'finish') | q=stop"
+    while True:
+        try:
+            choice = input(f"[guided] {hint}\n> ").strip()
+        except EOFError:
+            return action
+        if not choice:
+            return action
+        if choice.lower() in ("q", "quit", "stop"):
+            return None
+        new_action = parse_human_action(choice, target)
+        if new_action:
+            return new_action
+        print("    > unrecognized action; try again, or ENTER to run the suggestion.")
+
+
+def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, interactive, think, shell_enabled, guided):
     print(f"[*] target {target} | brain {model} @ {host}"
           + (" | exploit ON" if exploit_enabled else "")
           + ("" if interactive else " | non-interactive")
@@ -276,6 +341,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
     seen = []
     stuck = 0
     auto_approve = False
+    credentials = []
 
     for step in range(1, max_steps + 1):
         if stuck >= STUCK_LIMIT:
@@ -290,7 +356,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
             else:
                 services = parse_services(last_scan) if last_scan else []
                 note = "Agent stopped: stuck after repeated unproductive steps; human input needed."
-                report = build_report(target, services, exploits, postexploit, note)
+                report = build_report(target, services, exploits, postexploit, note, credentials)
                 print("\n" + report)
                 print(f"[*] report saved to {save_report(target, report)}", file=sys.stderr)
                 return
@@ -299,18 +365,36 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
         messages.append({"role": "assistant", "content": json.dumps(action)})
         print(f"\n[{step}] {as_text(action.get('thought'))}")
 
+        if guided and interactive:
+            action = guided_choice(action, target)
+            if action is None:
+                services = parse_services(last_scan) if last_scan else []
+                report = build_report(target, services, exploits, postexploit,
+                                      "Session stopped by the operator (guided mode).", credentials)
+                print("\n" + report)
+                print(f"[*] report saved to {save_report(target, report)}")
+                return
+            messages[-1] = {"role": "assistant", "content": json.dumps(action)}
+
         kind = action.get("action")
         if kind in TOOLS:
-            output = run_tool(kind, action, scope_file, done, messages)
+            output = run_tool(kind, action, target, scope_file, done, messages)
             if output is not None:
                 stuck = 0
                 seen.append(output)
                 if TOOLS[kind].get("is_scan"):
                     last_scan = output
+                if kind == "hydra":
+                    found = extract_credentials(output)
+                    if found:
+                        credentials.extend(c for c in found if c not in credentials)
+                        print("    [+] credentials found:")
+                        for c in found:
+                            print(f"        {c}")
             else:
                 stuck += 1
         elif kind == "exploit":
-            scan_target = as_text(action.get("target"))
+            scan_target = target
             module_key = as_text(action.get("module"))
             if not exploit_enabled:
                 messages.append({"role": "user", "content": "Observation: exploitation is disabled (run with --exploit)."})
@@ -322,7 +406,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
                     f"Already tried {module_key} on {scan_target}. Use the result or finish."})
                 stuck += 1
                 continue
-            if interactive and not auto_approve and module_key in MODULES:
+            if interactive and not auto_approve and not guided and module_key in MODULES:
                 decision = ask_approval(f"Run exploit {module_key} on {scan_target}?")
                 if decision == "all":
                     auto_approve = True
@@ -357,8 +441,16 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
                 else:
                     collected = parse_collection(output)
                     postexploit.update(collected)
-                    if shell_enabled and interactive:
-                        print("    > opening interactive shell on the target (msfconsole); type 'exit' to return...")
+                    if interactive and guided:
+                        try:
+                            answer = input(f"[?] Exploit succeeded. Open a root shell on {scan_target}? [y/N] ").strip().lower()
+                        except EOFError:
+                            answer = ""
+                        open_shell = answer in ("y", "yes", "o", "oui")
+                    else:
+                        open_shell = shell_enabled and interactive
+                    if open_shell:
+                        print("    > opening interactive shell on the target (msfconsole)...")
                         interactive_exploit(scan_target, module_key, scope_file)
                     labels = ", ".join(k for k in POST_COMMANDS if collected.get(k))
                     observation = (f"{module_key}: {outcome}. Read-only post-exploitation collected "
@@ -370,7 +462,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
             shell = any("shell opened" in e for e in exploits)
             open_ports = scan_ports(last_scan) if last_scan else []
             not_enumed = [p for p in open_ports if p not in enum_ports]
-            if not shell and len(enum_ports) < MIN_ENUM_BEFORE_FINISH and not_enumed:
+            if not guided and not shell and len(enum_ports) < MIN_ENUM_BEFORE_FINISH and not_enumed:
                 print(f"    > finish blocked ({len(enum_ports)}/{MIN_ENUM_BEFORE_FINISH} services enumerated)")
                 messages.append({"role": "user", "content":
                     f"Not enough reconnaissance to conclude: {len(enum_ports)} service(s) enumerated, "
@@ -381,7 +473,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
             corpus = "\n".join(seen)
             findings = scrub_unverified_cves(as_text(action.get("report")), corpus)
             services = parse_services(last_scan) if last_scan else []
-            report = build_report(target, services, exploits, postexploit, findings)
+            report = build_report(target, services, exploits, postexploit, findings, credentials)
             print("\n" + report)
             print(f"[*] report saved to {save_report(target, report)}")
             return
@@ -428,6 +520,8 @@ def main():
                         help="enable the model's internal reasoning (slower; richer thoughts on qwen3)")
     parser.add_argument("--shell", action="store_true",
                         help="after a successful exploit, hand an interactive root shell to the human (interactive only)")
+    parser.add_argument("--guided", action="store_true",
+                        help="validate or redirect each action before it runs (interactive only)")
     args = parser.parse_args()
 
     problems = preflight(args.host, args.scope)
@@ -438,7 +532,7 @@ def main():
 
     interactive = sys.stdin.isatty() and not args.yes
     start = time.monotonic()
-    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think, args.shell)
+    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think, args.shell, args.guided)
     print(f"[*] total time: {time.monotonic() - start:.1f}s")
 
 
