@@ -17,6 +17,7 @@ import requests
 
 from nmap_tool import run_nmap
 from enum_tool import run_enum
+from hydra_tool import run_hydra
 from exploit_tool import MODULES
 from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS, interactive_exploit
 
@@ -36,6 +37,12 @@ TOOLS = {
         "desc": "deeper scan of ONE port on the target (runs nmap vulnerability scripts).",
         "extra_params": ["port"],
         "run": run_enum,
+    },
+    "hydra": {
+        "desc": "brute-force login on ONE service of the target with a small list of common weak credentials. ftp and telnet are usually quickest; ssh is often slow or rejects old key exchanges.",
+        "hint": "If an authentication service (ftp, telnet, ssh) is open, run hydra on it to try weak credentials (prefer ftp or telnet) before concluding.",
+        "extra_params": ["service"],
+        "run": run_hydra,
     },
 }
 
@@ -111,6 +118,7 @@ def build_prompt(exploit_enabled):
 
     tool_list = "\n".join(tool_lines)
     keywords = ", ".join(action_keywords)
+    tool_hints = "".join(f"- {meta['hint']}\n" for meta in TOOLS.values() if meta.get("hint"))
     return (
         "You are an autonomous penetration-testing agent operating in an authorized lab.\n"
         "You choose one action at a time; an external executor runs it and returns the result.\n\n"
@@ -121,6 +129,7 @@ def build_prompt(exploit_enabled):
         f"- The 'action' field must be EXACTLY one keyword ({keywords}). Never put a sentence there.\n"
         "- Start with nmap. Then use enum on the most interesting or outdated service.\n"
         "- Enumerate SEVERAL interesting services before finishing; do not conclude after a single enum.\n"
+        f"{tool_hints}"
         f"{exploit_rule}"
         "- Base every statement strictly on the observations returned to you. Never invent a port, service, version, or result.\n"
         "- Do not cite a CVE number unless it appears verbatim in an observation.\n"
