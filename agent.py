@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from datetime import datetime
 
 import requests
@@ -184,8 +185,10 @@ def build_report(target, services, exploits, postexploit, findings):
     )
 
 
-def ask_llm(host, model, messages):
+def ask_llm(host, model, messages, think=True):
     payload = {"model": model, "messages": messages, "stream": False, "format": "json"}
+    if not think:
+        payload["think"] = False
     error = "unknown error"
     for _ in range(2):
         try:
@@ -195,6 +198,7 @@ def ask_llm(host, model, messages):
             return data if isinstance(data, dict) else {"action": "error", "thought": "model returned non-object JSON"}
         except requests.exceptions.RequestException as e:
             error = f"cannot reach the model server: {e}"
+            payload.pop("think", None)  # some models reject 'think'; drop it and retry
         except (json.JSONDecodeError, KeyError):
             return {"action": "error", "thought": "model returned invalid JSON"}
     return {"action": "error", "thought": error}
@@ -246,10 +250,11 @@ def run_tool(kind, action, scope_file, done, messages):
     return output
 
 
-def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, interactive):
+def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, interactive, think):
     print(f"[*] target {target} | brain {model} @ {host}"
           + (" | exploit ON" if exploit_enabled else "")
-          + ("" if interactive else " | non-interactive"))
+          + ("" if interactive else " | non-interactive")
+          + (" | thinking" if think else ""))
     messages = [
         {"role": "system", "content": build_prompt(exploit_enabled)},
         {"role": "user", "content": f"Assess target {target}. Decide the first action."},
@@ -280,7 +285,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
                 print(f"[*] report saved to {save_report(target, report)}", file=sys.stderr)
                 return
 
-        action = ask_llm(host, model, messages)
+        action = ask_llm(host, model, messages, think)
         messages.append({"role": "assistant", "content": json.dumps(action)})
         print(f"\n[{step}] {as_text(action.get('thought'))}")
 
@@ -401,11 +406,13 @@ def main():
         default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
         help="Ollama server URL (default: $OLLAMA_HOST or localhost)",
     )
-    parser.add_argument("-m", "--model", default="qwen2.5:7b", help="model name")
+    parser.add_argument("-m", "--model", default="qwen3:8b", help="model name")
     parser.add_argument("--max-steps", type=int, default=8, help="max reasoning steps")
     parser.add_argument("--exploit", action="store_true", help="enable exploitation of known lab vulns (off by default)")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="auto-approve everything; never pause for confirmation or hints")
+    parser.add_argument("--think", action="store_true",
+                        help="enable the model's internal reasoning (slower; richer thoughts on qwen3)")
     args = parser.parse_args()
 
     problems = preflight(args.host, args.scope)
@@ -415,7 +422,9 @@ def main():
         sys.exit(1)
 
     interactive = sys.stdin.isatty() and not args.yes
-    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive)
+    start = time.monotonic()
+    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think)
+    print(f"[*] total time: {time.monotonic() - start:.1f}s")
 
 
 if __name__ == "__main__":
