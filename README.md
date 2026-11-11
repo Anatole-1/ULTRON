@@ -47,6 +47,11 @@ La cible vient toujours de la ligne de commande (le modèle ne peut pas la chang
   main (`shell` pour un vrai shell où `cd` persiste).
 - **Mode guidé** (`--guided`) : avant chaque action, l'agent montre ce qu'il veut
   faire et **vous décidez** — accepter, remplacer par votre action, ou arrêter.
+- **Mode rapide déterministe** (`--fast`) : une playbook en code pur pilote tout
+  l'enchaînement (recon → exploit si un module matche → credentials → **réutilisation
+  de credentials** sur les autres services via `hydra -C` → rapport), **sans LLM ni
+  serveur IA**. Les mots de passe connus incluent ceux **cassés localement** depuis
+  les hashes `/etc/shadow` collectés (john), au-delà de la wordlist hydra.
 - **Human-in-the-loop** : approbation avant exploit, indice si l'agent bloque.
   `-y` = autonome sans question. Non destructif et scope-gated de bout en bout.
 
@@ -75,6 +80,11 @@ command line (the model cannot change it).
   to you (`shell` for a real shell where `cd` persists).
 - **Guided mode** (`--guided`): before each action the agent shows what it wants
   to do and **you decide** — accept, replace with your own action, or stop.
+- **Deterministic fast mode** (`--fast`): a pure-code playbook drives the whole
+  chain (recon → exploit when a module matches → credentials → **credential reuse**
+  across the other services via `hydra -C` → report), with **no LLM and no AI
+  server**. Known passwords include ones **cracked locally** from the collected
+  `/etc/shadow` hashes (john), beyond hydra's wordlist.
 - **Human-in-the-loop**: approval before exploits, a hint when the agent is stuck.
   `-y` runs unattended. Non-destructive and scope-gated throughout.
 
@@ -92,6 +102,7 @@ python3 agent.py <target-ip> --host http://<ai-server-ip>:11434 --exploit       
 python3 agent.py <target-ip> --host http://<ai-server-ip>:11434 --exploit --shell   # + a Meterpreter root shell
 python3 agent.py <target-ip> --host http://<ai-server-ip>:11434 --exploit --guided  # you steer every action
 python3 agent.py <target-ip> --host http://<ai-server-ip>:11434 --exploit -y    # unattended, no prompts
+python3 agent.py <target-ip> --fast --exploit                                   # deterministic playbook only (no LLM / no AI server)
 ```
 
 `scope.txt` and generated reports stay local (git-ignored). Each run prints its
@@ -107,6 +118,7 @@ total time; adding a tool is a single entry in the `TOOLS` registry.
 | `--exploit`          | Enable exploitation (off by default) · active l'exploitation. |
 | `--shell`            | Hand a Meterpreter root shell after a successful exploit (interactive) · shell root après exploit. |
 | `--guided`           | Validate or redirect each action before it runs (interactive) · valider/rediriger chaque action. |
+| `--fast`             | Deterministic playbook only, no LLM / no AI server · playbook déterministe, sans LLM. |
 | `-y`, `--yes`        | Auto-approve, no prompts · tout approuver, sans question. |
 | `--think`            | Enable model reasoning (slower) · active le raisonnement (plus lent). |
 
@@ -123,12 +135,13 @@ The server address is never hard-coded (read from `--host` / `OLLAMA_HOST`).
 
 | File | Purpose · Rôle |
 |------|----------------|
-| `agent.py`            | Orchestrator + ReAct loop, tool registry, guided mode, report builder. |
+| `agent.py`            | Orchestrator + ReAct loop, deterministic playbook (`--fast`), tool registry, guided mode, report builder. |
 | `nmap_tool.py`        | Recon: scope-checked `nmap -sV` scan. |
 | `enum_tool.py`        | Per-port enumeration: nmap vulnerability scripts. |
 | `hydra_tool.py`       | Credential attack: scope-checked hydra with a small weak-password list. |
 | `exploit_tool.py`     | Exploitation: scope-checked, allow-listed Metasploit modules. |
 | `postexploit_tool.py` | Non-destructive post-exploitation + Meterpreter shell handoff. |
+| `crack_tool.py`       | Local password cracking (john) on collected hashes, to feed credential reuse. |
 | `scope.py`            | The central safeguard: is a target in scope? |
 | `scope.txt.example`   | Template scope file (copy to `scope.txt`). |
 | `requirements.txt`    | Python dependencies (`requests`). |
@@ -150,6 +163,9 @@ The server address is never hard-coded (read from `--host` / `OLLAMA_HOST`).
 - [x] Meterpreter root-shell handoff to the operator (`--shell`)
 - [x] Guided mode: the operator accepts/redirects/stops each action (`--guided`)
 - [x] Human-in-the-loop, run timing, analysis CVE-scrubbing
+- [x] Deterministic playbook + fast mode (`--fast`), no LLM, with credential reuse
+- [x] Local hash cracking (john) on collected `/etc/shadow`, feeding credential reuse
+- [ ] LLM fallback only on unknown service/version (hybrid playbook + model)
 - [ ] More exploit modules and lab targets (DVWA, VulnHub, HTB)
 - [ ] Larger wordlists for credential attacks on real targets
 

