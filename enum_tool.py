@@ -14,7 +14,7 @@ def run_enum(target, port, scope_file):
         return None
     try:
         result = subprocess.run(
-            ["nmap", "-sV", "--script", "vuln", "--script-timeout", "30s", "-p", port, target],
+            ["nmap", "-Pn", "-sV", "--script", "vuln", "--script-timeout", "30s", "-p", port, target],
             capture_output=True,
             text=True,
             timeout=150,
