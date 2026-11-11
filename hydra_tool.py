@@ -6,10 +6,8 @@ import os
 import subprocess
 import tempfile
 
+import wordlists
 from scope import load_scope, is_in_scope
-
-USERS = ["msfadmin", "user", "admin", "root", "service", "postgres"]
-PASSWORDS = ["msfadmin", "user", "admin", "password", "root", "toor", "postgres", "123456"]
 
 # Per-service hydra timeout in seconds. telnet negotiates slowly and can hang,
 # so we cap it low (fail fast, move on) instead of wasting the default budget.
@@ -21,21 +19,35 @@ def _timeout_for(service):
     return SERVICE_TIMEOUTS.get(service, DEFAULT_TIMEOUT)
 
 
-def run_hydra(target, service, scope_file):
+def run_hydra(target, service, scope_file, level=None):
+    """Brute-force ONE auth service. The username/password lists come from the
+    active wordlist level (see wordlists.set_active); `level` overrides it. The
+    built-in level keeps the historical small in-memory password list; bigger
+    levels hand hydra a capped on-disk file (-P) instead. Scope-gated."""
     service = "".join(ch for ch in str(service).lower() if ch.isalnum())
     if not service:
         return None
     if not is_in_scope(target, load_scope(scope_file)):
         return None
+
+    users = wordlists.hydra_users(level)
     uf = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
-    uf.write("\n".join(USERS) + "\n")
+    uf.write("\n".join(users) + "\n")
     uf.close()
-    pf = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
-    pf.write("\n".join(PASSWORDS) + "\n")
-    pf.close()
+
+    # Bigger levels resolve to a real file on disk; builtin falls back to the
+    # small in-memory list written to a temp file.
+    pfile = wordlists.hydra_password_file(level)
+    own_pf = pfile is None
+    if own_pf:
+        pf = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        pf.write("\n".join(wordlists.BUILTIN_PASSWORDS) + "\n")
+        pf.close()
+        pfile = pf.name
+
     try:
         result = subprocess.run(
-            ["hydra", "-L", uf.name, "-P", pf.name, "-t", "4", target, service],
+            ["hydra", "-L", uf.name, "-P", pfile, "-t", "4", target, service],
             capture_output=True, text=True, timeout=_timeout_for(service),
         )
         return (result.stdout + result.stderr).strip()
@@ -43,7 +55,8 @@ def run_hydra(target, service, scope_file):
         return f"hydra on {service} timed out."
     finally:
         os.unlink(uf.name)
-        os.unlink(pf.name)
+        if own_pf:
+            os.unlink(pfile)
 
 
 def run_hydra_combo(target, service, pairs, scope_file):

@@ -38,6 +38,12 @@ La cible vient toujours de la ligne de commande (le modèle ne peut pas la chang
 - **Attaque de credentials** (`hydra`) : brute-force des services d'auth ouverts
   (ftp, telnet…) avec une petite liste de mots de passe faibles ; les identifiants
   trouvés sont affichés en direct et listés dans le rapport.
+- **Niveaux de wordlist** (`--wordlist builtin|common|rockyou`) : `builtin`
+  (défaut labo, court et rapide), `common` (liste de John) ou `rockyou` (fuite
+  classique). Borné : hydra ne teste que le top-2000 (rockyou est trié par
+  fréquence) et rockyou est décompressé **une fois** en cache ; john reçoit la
+  liste complète (limité par le temps, pas le nombre). Le niveau s'applique aux
+  deux chemins (LLM et `--fast`).
 - **Exploitation** (off par défaut, `--exploit`) : allow-list de modules Metasploit
   vérifiés, scope revérifié, `LHOST` auto, déclencheur par module.
 - **Post-exploitation** : une fois root, collecte **en lecture seule** (identité,
@@ -71,6 +77,11 @@ command line (the model cannot change it).
 - **Credential attacks** (`hydra`): brute-force open auth services (ftp, telnet…)
   with a small list of common weak passwords; found logins are shown live and
   listed in the report.
+- **Wordlist levels** (`--wordlist builtin|common|rockyou`): `builtin` (fast lab
+  default), `common` (John's list), or `rockyou` (the classic leak). Bounded:
+  hydra only tries the top-2000 (rockyou is frequency-ordered) and rockyou is
+  decompressed **once** into a cache; john gets the full list (time-bounded, not
+  count-bounded). The level applies to both paths (LLM and `--fast`).
 - **Exploitation** (off by default, `--exploit`): allow-listed Metasploit modules,
   re-checked scope, auto-detected `LHOST`, per-module trigger.
 - **Post-exploitation**: once root, **read-only** collection (identity, accounts,
@@ -138,7 +149,8 @@ The server address is never hard-coded (read from `--host` / `OLLAMA_HOST`).
 | `agent.py`            | Orchestrator + ReAct loop, deterministic playbook (`--fast`), tool registry, guided mode, report builder. |
 | `nmap_tool.py`        | Recon: scope-checked `nmap -sV` scan. |
 | `enum_tool.py`        | Per-port enumeration: nmap vulnerability scripts. |
-| `hydra_tool.py`       | Credential attack: scope-checked hydra with a small weak-password list. |
+| `hydra_tool.py`       | Credential attack: scope-checked hydra, wordlist level from `wordlists.py`. |
+| `wordlists.py`        | Named wordlist levels (builtin/common/rockyou), shared by hydra and john; bounded + cached. |
 | `exploit_tool.py`     | Exploitation: scope-checked, allow-listed Metasploit modules. |
 | `postexploit_tool.py` | Non-destructive post-exploitation + Meterpreter shell handoff. |
 | `crack_tool.py`       | Local password cracking (john) on collected hashes, to feed credential reuse. |
@@ -167,7 +179,7 @@ The server address is never hard-coded (read from `--host` / `OLLAMA_HOST`).
 - [x] Local hash cracking (john) on collected `/etc/shadow`, feeding credential reuse
 - [ ] LLM fallback only on unknown service/version (hybrid playbook + model)
 - [ ] More exploit modules and lab targets (DVWA, VulnHub, HTB)
-- [ ] Larger wordlists for credential attacks on real targets
+- [x] Larger wordlists for credential attacks (`--wordlist common|rockyou`, bounded + cached)
 
 ## Inspirations · License
 

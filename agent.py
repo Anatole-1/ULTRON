@@ -21,6 +21,7 @@ from hydra_tool import run_hydra, run_hydra_combo
 from exploit_tool import MODULES
 from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS, interactive_exploit
 from crack_tool import crack_hashes
+import wordlists
 
 
 # Registry of simple recon/collection tools. Each runs as
@@ -359,6 +360,7 @@ def guided_choice(action, target):
 def run_mission(host, model, scope_file, target, max_steps, exploit_enabled, interactive, think, shell_enabled, guided):
     print(f"[*] target {target} | brain {model} @ {host}"
           + (" | exploit ON" if exploit_enabled else "")
+          + f" | wordlist {wordlists.active()}"
           + ("" if interactive else " | non-interactive")
           + (" | thinking" if think else ""))
     messages = [
@@ -592,6 +594,7 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
     execution but the next action comes from decide_next() instead of the model."""
     print(f"[*] target {target} | FAST playbook (no LLM)"
           + (" | exploit ON" if exploit_enabled else "")
+          + f" | wordlist {wordlists.active()}"
           + ("" if interactive else " | non-interactive"))
     state = {
         "target": target,
@@ -637,7 +640,8 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
                 postexploit.update(collected)
                 print(f"    [+] {outcome}")
                 cracked = crack_hashes(collected.get("accounts", ""),
-                                       collected.get("password_hashes", ""))
+                                       collected.get("password_hashes", ""),
+                                       wordlist=wordlists.crack_wordlist())
                 if cracked:
                     print(f"    [+] cracked {len(cracked)} password(s) from /etc/shadow:")
                     for pair in cracked:
@@ -719,6 +723,10 @@ def main():
                         help="validate or redirect each action before it runs (interactive only)")
     parser.add_argument("--fast", action="store_true",
                         help="run the deterministic playbook only (no LLM, no Ollama needed)")
+    parser.add_argument("--wordlist", choices=wordlists.LEVELS, default="builtin",
+                        help="credential wordlist level: builtin (small/fast lab default), "
+                             "common (John's list), rockyou (capped top-%d for hydra, full for john)"
+                             % wordlists.HYDRA_MAX_PASSWORDS)
     args = parser.parse_args()
 
     problems = preflight(args.host, args.scope, need_llm=not args.fast)
@@ -726,6 +734,11 @@ def main():
         for p in problems:
             print(f"[!] {p}", file=sys.stderr)
         sys.exit(1)
+
+    wordlists.set_active(args.wordlist)
+    if args.wordlist != "builtin" and wordlists.hydra_password_file() is None:
+        print(f"[!] wordlist '{args.wordlist}' not found on disk; "
+              "hydra falls back to the builtin password list", file=sys.stderr)
 
     interactive = sys.stdin.isatty() and not args.yes
     start = time.monotonic()
