@@ -49,9 +49,17 @@ La cible vient toujours de la ligne de commande (le modèle ne peut pas la chang
   scope revérifié, `LHOST` auto, déclencheur par module.
 - **Post-exploitation** : une fois root, collecte **en lecture seule** (identité,
   comptes, hashes, réseau). Jamais de persistance, destruction ou exfiltration.
+- **Capture de session** : en plus du rapport, chaque run écrit un transcript
+  horodaté dans `logs/` — tout ce qui défile dans le terminal, écrit en continu
+  (survit à un crash). Le handoff `--shell` interactif n'y est pas capturé.
 - **Shell interactif** (`--shell`, ou à la demande en mode guidé) : après un
-  exploit réussi, l'agent ouvre une session **Meterpreter** root et vous rend la
-  main (`shell` pour un vrai shell où `cd` persiste).
+  exploit réussi, l'agent vous rend la main sur un **shell root**. Il tente une
+  session **Meterpreter** (plus confortable), mais la session cible est découverte
+  dynamiquement et, si l'upgrade Meterpreter meurt (cibles fragiles, ex. Kioptrix),
+  il **retombe automatiquement sur le shell brut root** au lieu de vous laisser en
+  rade. Sur un shell brut, il **stabilise le TTY** (pose un vrai pty via
+  python/`script`) pour que la touche Entrée fonctionne ; faute d'outil pty sur une
+  cible très ancienne, validez les lignes avec `Ctrl+J`.
 - **Mode guidé** (`--guided`) : avant chaque action, l'agent montre ce qu'il veut
   faire et **vous décidez** — accepter, remplacer par votre action, ou arrêter.
 - **Mode rapide déterministe** (`--fast`) : une playbook en code pur pilote tout
@@ -88,9 +96,17 @@ command line (the model cannot change it).
   re-checked scope, auto-detected `LHOST`, per-module trigger.
 - **Post-exploitation**: once root, **read-only** collection (identity, accounts,
   hashes, network). No persistence, destruction, or exfiltration.
+- **Session transcript**: besides the report, every run writes a timestamped log
+  to `logs/` — everything printed to the terminal, flushed as it goes (survives a
+  crash). The interactive `--shell` handoff is not captured.
 - **Interactive shell** (`--shell`, or on demand in guided mode): after a
-  successful exploit, the agent opens a **Meterpreter** root session and hands it
-  to you (`shell` for a real shell where `cd` persists).
+  successful exploit, the agent hands you a **root shell**. It tries a
+  **Meterpreter** session (nicer), but the target session id is discovered at
+  runtime and, if the Meterpreter upgrade dies (fragile targets, e.g. Kioptrix),
+  it **falls back automatically to the raw root shell** instead of stranding you.
+  On a raw shell it **stabilizes the TTY** (spawns a real pty via python/`script`)
+  so the Enter key works; if no pty tool exists on a very old target, submit lines
+  with `Ctrl+J`.
 - **Guided mode** (`--guided`): before each action the agent shows what it wants
   to do and **you decide** — accept, replace with your own action, or stop.
 - **Deterministic fast mode** (`--fast`): a pure-code playbook drives the whole

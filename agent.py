@@ -699,6 +699,50 @@ def save_report(target, report, directory="reports"):
     return path
 
 
+class _Tee:
+    """Duplicates a text stream to a second file handle, so everything printed to
+    the console is also written verbatim to the session transcript. Delegates
+    anything else (isatty, fileno, ...) to the real stream so callers still see a
+    normal terminal."""
+
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+
+    def write(self, data):
+        n = self._stream.write(data)
+        try:
+            self._fh.write(data)
+        except (OSError, ValueError):
+            pass
+        return n
+
+    def flush(self):
+        self._stream.flush()
+        try:
+            self._fh.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def open_transcript(target, argv, directory="logs"):
+    """Open a timestamped .log that captures the whole terminal session, next to
+    (but separate from) the Markdown report. Returns (file_handle, path)."""
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{target}_{datetime.now():%Y-%m-%d_%H%M%S}.log")
+    fh = open(path, "w", buffering=1)  # line-buffered: survives a crash mid-run
+    fh.write(
+        "# ULTRON session transcript\n"
+        f"# target:  {target}\n"
+        f"# started: {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"# command: {' '.join(argv)}\n\n"
+    )
+    return fh, path
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="agent", description="Autonomous pentest agent — the LLM drives, scope is enforced."
@@ -741,12 +785,24 @@ def main():
               "hydra falls back to the builtin password list", file=sys.stderr)
 
     interactive = sys.stdin.isatty() and not args.yes
+
+    # Capture the whole console session to a .log, in addition to the report.
+    # (The interactive --shell handoff runs on the real terminal fd and is not
+    # captured; everything the agent itself prints is.)
+    transcript_fh, transcript_path = open_transcript(args.target, sys.argv)
+    orig_out, orig_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _Tee(orig_out, transcript_fh), _Tee(orig_err, transcript_fh)
     start = time.monotonic()
-    if args.fast:
-        run_fast(args.scope, args.target, args.max_steps, args.exploit, interactive, args.shell)
-    else:
-        run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think, args.shell, args.guided)
-    print(f"[*] total time: {time.monotonic() - start:.1f}s")
+    try:
+        if args.fast:
+            run_fast(args.scope, args.target, args.max_steps, args.exploit, interactive, args.shell)
+        else:
+            run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think, args.shell, args.guided)
+        print(f"[*] total time: {time.monotonic() - start:.1f}s")
+    finally:
+        sys.stdout, sys.stderr = orig_out, orig_err
+        transcript_fh.close()
+    print(f"[*] session transcript saved to {transcript_path}")
 
 
 if __name__ == "__main__":

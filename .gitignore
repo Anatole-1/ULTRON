@@ -17,6 +17,7 @@ env/
 # === Generated files (logs, reports) ===
 *.log
 reports/
+logs/
 output/
 
 # === Scope (rules of engagement) — local only ===
