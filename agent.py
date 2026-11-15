@@ -16,7 +16,7 @@ from datetime import datetime
 import requests
 
 from nmap_tool import run_nmap
-from enum_tool import run_enum
+from enum_tool import run_enum, run_smb_enum
 from hydra_tool import run_hydra, run_hydra_combo
 from exploit_tool import MODULES
 from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS, interactive_exploit
@@ -163,6 +163,40 @@ def parse_services(nmap_output):
     return services
 
 
+def smb_open(services):
+    """True if SMB (139 or 445) is open in the parsed nmap service lines."""
+    for line in services:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "open":
+            port = parts[0].split("/")[0]
+            if port in ("139", "445"):
+                return True
+    return False
+
+
+def summarize_smb_enum(output):
+    """Pull the readable NSE results out of raw nmap SMB-enum output: the
+    'Host script results:' block (where smb-os-discovery, smb-security-mode,
+    smb-enum-shares, smb-vuln-* report) plus any port-level script lines."""
+    if not output:
+        return ""
+    kept = []
+    in_hostscripts = False
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Host script results:"):
+            in_hostscripts = True
+            continue
+        if in_hostscripts:
+            if stripped.startswith("|"):
+                kept.append(line.rstrip())
+            elif stripped == "":
+                continue
+            else:
+                break  # left the host-script block
+    return "\n".join(kept).strip()
+
+
 def exploit_result(output):
     low = output.lower()
     if "session" in low and "opened" in low:
@@ -184,14 +218,19 @@ def build_postexploit_section(collected):
     return "\n\n".join(blocks) if blocks else "_(no data collected)_"
 
 
-def build_report(target, services, exploits, postexploit, findings, credentials=None):
+def build_report(target, services, exploits, postexploit, findings, credentials=None,
+                 enumeration=None):
     service_lines = "\n".join(f"- {s}" for s in services) if services else "- (no nmap scan completed)"
     exploit_lines = "\n".join(f"- {e}" for e in exploits) if exploits else "- (none attempted)"
     cred_lines = "\n".join(f"- {c}" for c in credentials) if credentials else "- (none found)"
+    enum_section = ""
+    if enumeration:
+        enum_section = f"## SMB / Windows enumeration\n```\n{enumeration}\n```\n\n"
     return (
         f"# Pentest report - {target}\n\n"
         f"_Generated {datetime.now():%Y-%m-%d %H:%M}_\n\n"
         f"## Open services\n{service_lines}\n\n"
+        f"{enum_section}"
         f"## Exploitation\n{exploit_lines}\n\n"
         f"## Credentials\n{cred_lines}\n\n"
         f"## Post-exploitation\n{build_postexploit_section(postexploit)}\n\n"
@@ -309,6 +348,8 @@ def describe_action(action, target):
         return f"exploit {as_text(action.get('module')) or '?'} on {target}"
     if kind == "finish":
         return "finish (write the report)"
+    if kind == "smb_enum":
+        return f"smb_enum {target} (Windows/SMB NSE: os-discovery, signing, shares, sessions, vuln)"
     if kind in TOOLS:
         extras = " ".join(as_text(action.get(p)) for p in TOOLS[kind]["extra_params"])
         return f"{kind} {target} {extras}".strip()
@@ -569,6 +610,12 @@ def decide_next(state):
 
     services = state["services"]
 
+    # Windows-aware recon: if SMB is exposed, enumerate it once before anything
+    # else. On a modern/hardened host this is the only real surface, and the
+    # facts it gathers (OS, signing, shares, vuln) inform every later decision.
+    if smb_open(services) and not state.get("smb_enum_done"):
+        return {"action": "smb_enum", "target": target}
+
     # Exploit only while we have no shell yet: once root is obtained we stop
     # launching modules (this also avoids back-to-back exploits the VM dislikes).
     if state["exploit_enabled"] and not state["shell_opened"]:
@@ -606,11 +653,17 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
         "reuse_done": set(),
         "cred_pairs": [],
         "shell_opened": False,
+        "smb_enum_done": False,
     }
     exploits = []
     postexploit = {}
+    smb_enum_text = None
 
-    for step in range(1, max_steps + 1):
+    # The deterministic playbook never loops on the LLM, so its steps are free;
+    # give it enough headroom to finish a busy box (nmap + smb_enum + hydra/reuse
+    # per auth service + finish) instead of hitting the LLM-tuned default of 8.
+    effective_max = max(max_steps, 24)
+    for step in range(1, effective_max + 1):
         action = decide_next(state)
         kind = action["action"]
         print(f"\n[{step}] playbook -> {describe_action(action, target)}")
@@ -623,6 +676,15 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
             state["scan"] = output
             state["services"] = parse_services(output)
             print(f"    > {len(state['services'])} open service(s) found")
+
+        elif kind == "smb_enum":
+            output = run_smb_enum(target, scope_file)
+            state["smb_enum_done"] = True
+            if output is None:
+                print("    [!] smb enum refused: target not in scope")
+            else:
+                smb_enum_text = summarize_smb_enum(output) or "(no SMB script output)"
+                print(f"    > SMB enumeration complete ({len(smb_enum_text.splitlines())} line(s))")
 
         elif kind == "exploit":
             module_key = action["module"]
@@ -683,7 +745,8 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
             findings = "Deterministic playbook run (--fast, no LLM)."
             credentials = [f"{p['service']} {p['user']} / {p['password']}"
                            for p in state["cred_pairs"]]
-            report = build_report(target, services, exploits, postexploit, findings, credentials)
+            report = build_report(target, services, exploits, postexploit, findings,
+                                   credentials, enumeration=smb_enum_text)
             print("\n" + report)
             print(f"[*] report saved to {save_report(target, report)}")
             return
