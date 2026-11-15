@@ -1,14 +1,22 @@
-# Autonomous Pentest AI · IA de pentest autonome (ULTRON)
+# ULTRON · scope-gated pentest orchestrator (optional local-LLM brain)
+# Orchestrateur de pentest borné au scope · cerveau LLM local optionnel
 
-A local-LLM agent that runs a whole pentest on its own: recon → credential
-attacks → vulnerability ID → exploitation → non-destructive post-exploitation →
-written report, and can hand you an interactive Meterpreter root shell.
-Not a chatbot — an **agent** that decides and acts in a loop until the report.
+ULTRON runs a full pentest chain on a target — recon → credential attacks →
+vulnerability ID → exploitation → non-destructive post-exploitation → written
+report — and can hand you an interactive Meterpreter root shell. The chain is
+driven by a **deterministic, scope-gated orchestrator**; an optional local-LLM
+layer (ReAct loop) can pick each action instead, but it is only as good as the
+local model — with a small model like `qwen3:8b` it stays limited, so the
+deterministic playbook (`--fast`) is the reliable path. Study / portfolio project.
 
-Un agent piloté par un LLM local qui mène seul tout un pentest : reconnaissance
-→ attaque de credentials → identification de vulnérabilités → exploitation →
-post-exploitation non destructive → rapport, et peut vous donner un shell root
-Meterpreter interactif. Projet d'étude / portfolio.
+ULTRON déroule toute une chaîne de pentest sur une cible — reconnaissance →
+attaque de credentials → identification de vulnérabilités → exploitation →
+post-exploitation non destructive → rapport — et peut vous rendre un shell root
+Meterpreter interactif. La chaîne est pilotée par un **orchestrateur déterministe
+et borné au scope** ; une couche LLM locale optionnelle (boucle ReAct) peut
+choisir chaque action à la place, mais elle ne vaut que le modèle local — avec un
+petit modèle comme `qwen3:8b` elle reste limitée, donc le playbook déterministe
+(`--fast`) est le chemin fiable. Projet d'étude / portfolio.
 
 > ⚠️ **Lab use only.** Runs real exploits and can open a root shell. Use it only
 > on VMs you own (isolated network) or systems you have written authorization for.
@@ -24,14 +32,20 @@ Meterpreter interactif. Projet d'étude / portfolio.
 
 ## 🇫🇷 Français
 
-On lance l'agent avec une cible ; il se pilote dans une boucle ReAct
-(observer → raisonner → agir) : recon nmap → énumération par port → attaque de
-credentials → (optionnel) exploitation → post-exploitation → rapport.
+Deux modes d'exécution. Le mode par défaut est une **boucle ReAct pilotée par le
+LLM** (observer → raisonner → agir) : recon nmap → énumération par port → attaque
+de credentials → (optionnel) exploitation → post-exploitation → rapport. Le mode
+`--fast` est une **playbook déterministe** en code pur qui déroule la même chaîne
+**sans LLM ni serveur IA**. La boucle LLM ne vaut que le modèle local : avec un
+petit modèle comme `qwen3:8b` elle est limitée (JSON bancal, actions invalides
+re-promptées, CVE hallucinées filtrées), donc en pratique le playbook
+déterministe est le chemin le plus fiable.
 
-**Le LLM décide et analyse ; l'orchestrateur détient les faits.** Services
-ouverts, résultats d'exploitation, credentials et collecte post-exploitation sont
-construits à partir des sorties réelles des outils, jamais récités par le modèle.
-La cible vient toujours de la ligne de commande (le modèle ne peut pas la changer).
+**Quand le LLM est activé, il décide et analyse ; l'orchestrateur détient les
+faits et la sécurité.** Services ouverts, résultats d'exploitation, credentials et
+collecte post-exploitation sont construits à partir des sorties réelles des
+outils, jamais récités par le modèle. La cible vient toujours de la ligne de
+commande (le modèle ne peut pas la changer).
 
 - **Registre d'outils extensible** : ajouter un outil = une entrée + une fonction.
   Chaque outil peut porter un *hint* qui dit au modèle quand l'utiliser.
@@ -72,14 +86,20 @@ La cible vient toujours de la ligne de commande (le modèle ne peut pas la chang
 
 ## 🇬🇧 English
 
-You launch the agent with a target; it drives itself in a ReAct loop
-(observe → reason → act): nmap recon → per-port enumeration → credential attacks →
-(optional) exploitation → post-exploitation → report.
+Two execution modes. The default is an **LLM-driven ReAct loop** (observe →
+reason → act): nmap recon → per-port enumeration → credential attacks →
+(optional) exploitation → post-exploitation → report. The `--fast` mode is a
+**deterministic, pure-code playbook** that runs the same chain with **no LLM and
+no AI server**. The LLM loop is only as good as the local model: with a small
+model like `qwen3:8b` it is limited (shaky JSON, invalid actions re-prompted,
+hallucinated CVEs filtered out), so in practice the deterministic playbook is the
+dependable path.
 
-**The LLM decides and analyses; the orchestrator owns the facts.** Open services,
-exploitation results, credentials and post-exploitation collection are built from
-real tool output, never recited by the model. The target always comes from the
-command line (the model cannot change it).
+**When the LLM is enabled, it decides and analyses; the orchestrator owns the
+facts and the safety.** Open services, exploitation results, credentials and
+post-exploitation collection are built from real tool output, never recited by
+the model. The target always comes from the command line (the model cannot
+change it).
 
 - **Extensible tool registry**: adding a tool = one entry + one function. Each tool
   may carry a *hint* telling the model when to use it.
