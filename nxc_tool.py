@@ -112,3 +112,59 @@ def nxc_smb_shares(target, scope_file, user, password):
         [target, "-u", user, "-p", password, "--local-auth", "--shares"],
         timeout=60,
     )
+
+
+# --- Capability C: authenticated execution (read-only demonstration) ---------
+# With a valid (admin) credential, prove code execution the same way the Linux
+# post-exploitation does: a small allow-list of READ-ONLY commands that show
+# who/what the account is. Nothing here writes, deletes, or changes anything.
+WINDOWS_POST_COMMANDS = {
+    "identity": "whoami",
+    "privileges": "whoami /priv",
+    "hostname": "hostname",
+    "network": "ipconfig",
+    "local_users": "net user",
+}
+
+# An nxc line is "SMB  <host>  <port>  <HOSTNAME>  <content>"; grab <content>.
+_NXC_LINE_RE = re.compile(r"^\w+\s+\S+\s+\d+\s+\S+\s+(.*)$")
+
+
+def _nxc_content_lines(output):
+    """Strip nxc's banner columns from each line and drop status lines
+    ([+]/[-]/[*]), leaving just real command output."""
+    lines = []
+    for line in (output or "").splitlines():
+        m = _NXC_LINE_RE.match(line.rstrip())
+        if not m:
+            continue
+        content = m.group(1).rstrip()
+        if content and not content.lstrip().startswith(("[+]", "[-]", "[*]")):
+            lines.append(content)
+    return lines
+
+
+def nxc_smb_exec(target, scope_file, user, password, command):
+    """Run one command on the target via nxc (wmiexec/smbexec/atexec). Returns
+    the command's output lines (banner stripped), or None if out of scope."""
+    if not is_in_scope(target, load_scope(scope_file)):
+        return None
+    out = _nxc_smb(
+        [target, "-u", user, "-p", password, "--local-auth", "-x", command],
+        timeout=120,
+    )
+    return "\n".join(_nxc_content_lines(out)).strip()
+
+
+def windows_collection(target, scope_file, user, password):
+    """Run the read-only Windows command allow-list with a valid credential.
+    Returns {label: output} for the commands that produced output, or {} if out
+    of scope / nothing ran."""
+    if not is_in_scope(target, load_scope(scope_file)):
+        return {}
+    collected = {}
+    for label, command in WINDOWS_POST_COMMANDS.items():
+        out = nxc_smb_exec(target, scope_file, user, password, command)
+        if out:
+            collected[label] = out
+    return collected

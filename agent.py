@@ -17,10 +17,12 @@ import requests
 
 from nmap_tool import run_nmap
 from enum_tool import run_enum, run_smb_enum
-from nxc_tool import nxc_smb_spray, nxc_smb_shares
+from nxc_tool import (nxc_smb_spray, nxc_smb_shares, windows_collection,
+                      WINDOWS_POST_COMMANDS)
 from hydra_tool import run_hydra, run_hydra_combo
 from exploit_tool import MODULES
-from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS, interactive_exploit
+from postexploit_tool import (run_postexploit, parse_collection, POST_COMMANDS,
+                              interactive_exploit, interactive_exploit_windows)
 from crack_tool import crack_hashes
 import wordlists
 
@@ -211,10 +213,13 @@ def exploit_result(output):
 def build_postexploit_section(collected):
     if not collected:
         return "_(no post-exploitation performed)_"
+    # Look the command up in both the Linux and Windows allow-lists, and iterate
+    # over what was actually collected so either platform's labels render.
+    commands = {**POST_COMMANDS, **WINDOWS_POST_COMMANDS}
     blocks = []
-    for label, cmd in POST_COMMANDS.items():
-        body = collected.get(label)
+    for label, body in collected.items():
         if body:
+            cmd = commands.get(label, label)
             blocks.append(f"### {label} — `{cmd}`\n```\n{body}\n```")
     return "\n\n".join(blocks) if blocks else "_(no data collected)_"
 
@@ -733,6 +738,19 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
                         lines.append(f"Shares reachable as {admin_cred['user']}:")
                         lines.extend(f"  {s}" for s in share_lines)
                         print(f"    [+] {admin_cred['user']} can reach {len(share_lines)-1} share(s)")
+                    # Capability C: prove authenticated code execution with the
+                    # admin credential — a read-only Windows command allow-list,
+                    # then (interactive --shell only) a real SYSTEM shell.
+                    print(f"    > authenticated execution as {admin_cred['user']} (read-only collection)")
+                    col = windows_collection(target, scope_file, admin_cred["user"], admin_cred["password"])
+                    if col:
+                        postexploit.update(col)
+                        state["shell_opened"] = True
+                        print(f"    [+] code execution confirmed; collected {len(col)} item(s): {', '.join(col)}")
+                    if shell_enabled and interactive:
+                        print("    > opening interactive Windows admin shell (msf psexec)...")
+                        interactive_exploit_windows(target, scope_file,
+                                                    admin_cred["user"], admin_cred["password"])
                 smb_creds_text = "\n".join(lines)
 
         elif kind == "exploit":
