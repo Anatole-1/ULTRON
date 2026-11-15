@@ -665,12 +665,74 @@ def decide_next(state):
     return {"action": "finish", "target": target}
 
 
-def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_enabled):
+MAX_LLM_FALLBACKS = 4  # bound how many times the LLM may re-point the playbook
+
+
+def llm_fallback_action(host, model, target, services, state, think=False):
+    """Phase-2 hybrid fallback. The deterministic playbook has no known move
+    left (it would finish). Ask the LLM for ONE next action, CONSTRAINED to the
+    agent's existing allow-listed vocabulary — it only *selects* a known action
+    (enum a port, a vetted exploit module, hydra an auth service) or finishes; it
+    cannot invent a command, so scope and the module allow-list still hold.
+    Returns a validated action dict, or None to fall through to finishing."""
+    open_ports = scan_ports(state["scan"]) if state.get("scan") else []
+    enum_done = state.get("enum_done", set())
+    done_bits = []
+    if state.get("smb_enum_done"):
+        done_bits.append("smb_enum")
+    if state.get("nxc_spray_done"):
+        done_bits.append("nxc_spray")
+    if state["exploited"]:
+        done_bits.append("exploited=" + ",".join(sorted(state["exploited"])))
+    if state["hydra_done"]:
+        done_bits.append("hydra=" + ",".join(sorted(state["hydra_done"])))
+    if enum_done:
+        done_bits.append("enum=" + ",".join(sorted(enum_done)))
+    svc_text = "\n".join(f"- {s}" for s in services) or "- (none)"
+    system = (
+        "You choose the SINGLE next action for an automated, scope-restricted lab "
+        "pentest. The deterministic playbook ran out of known moves. Pick ONE "
+        "action that investigates a service not yet handled, or finish. "
+        "Reply with ONLY a compact JSON object, no prose."
+    )
+    user = (
+        f"Target: {target}\nOpen services:\n{svc_text}\n\n"
+        f"Already done: {', '.join(done_bits) or '(only nmap so far)'}\n\n"
+        "Allowed actions (choose exactly one, something NOT already done):\n"
+        '  {"action":"enum","port":"<an open port>"}  run nmap vuln scripts on that service\n'
+        f'  {{"action":"exploit","module":"<one of: {", ".join(MODULES.keys())}>"}}  only if a service clearly matches\n'
+        '  {"action":"hydra","service":"<ftp|ssh|telnet|mysql|postgres>"}  brute-force an open auth service\n'
+        '  {"action":"finish"}  nothing useful left to try\n\n'
+        "Prefer enum on an interesting un-enumerated port (web or unknown service). "
+        "Return finish if every open service has already been handled."
+    )
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    data = ask_llm(host, model, messages, think=think)
+    act = as_text(data.get("action")).lower()
+    if act == "enum":
+        port = "".join(ch for ch in as_text(data.get("port")) if ch.isdigit())
+        if port and port in open_ports and port not in enum_done:
+            return {"action": "enum", "port": port, "target": target}
+    elif act == "exploit":
+        mod = as_text(data.get("module"))
+        if state.get("exploit_enabled") and mod in MODULES and mod not in state["exploited"]:
+            return {"action": "exploit", "module": mod, "target": target}
+    elif act == "hydra":
+        svc = as_text(data.get("service")).lower()
+        if svc in auth_services_open(services) and svc not in state["hydra_done"]:
+            return {"action": "hydra", "service": svc, "target": target}
+    return None
+
+
+def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_enabled,
+             hybrid=False, llm_host=None, llm_model=None, think=False, guided=False):
     """Deterministic playbook loop: no LLM, no Ollama. Mirrors run_mission's
     execution but the next action comes from decide_next() instead of the model."""
-    print(f"[*] target {target} | FAST playbook (no LLM)"
+    print(f"[*] target {target} | {'HYBRID playbook (LLM fallback on the unknown)' if hybrid else 'FAST playbook (no LLM)'}"
           + (" | exploit ON" if exploit_enabled else "")
           + f" | wordlist {wordlists.active()}"
+          + (f" | model {llm_model}" if hybrid else "")
           + ("" if interactive else " | non-interactive"))
     state = {
         "target": target,
@@ -685,11 +747,14 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
         "smb_enum_done": False,
         "nxc_spray_done": False,
         "ms17_010_vuln": False,
+        "enum_done": set(),
+        "llm_fallbacks": 0,
     }
     exploits = []
     postexploit = {}
     smb_enum_text = None
     smb_creds_text = None
+    enum_findings = []
 
     # The deterministic playbook never loops on the LLM, so its steps are free;
     # give it enough headroom to finish a busy box (nmap + smb_enum + hydra/reuse
@@ -698,6 +763,27 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
     for step in range(1, effective_max + 1):
         action = decide_next(state)
         kind = action["action"]
+
+        # Hybrid: the playbook is out of known moves (would finish). Ask the LLM
+        # for ONE allow-listed action on the unknown; in guided mode the human
+        # confirms or redirects it. This is the only place the LLM is consulted.
+        if (kind == "finish" and hybrid and llm_host
+                and state["llm_fallbacks"] < MAX_LLM_FALLBACKS):
+            state["llm_fallbacks"] += 1
+            print(f"\n[*] playbook exhausted; consulting the LLM ({llm_model}) for the unknown...")
+            sugg = llm_fallback_action(llm_host, llm_model, target, state["services"], state, think)
+            if sugg:
+                if guided and interactive:
+                    sugg = guided_choice(sugg, target)
+                if sugg is None:
+                    action = {"action": "finish", "target": target}
+                else:
+                    action = sugg
+                    print(f"    [LLM fallback] suggests: {describe_action(action, target)}")
+            else:
+                print("    [LLM fallback] no useful action suggested; finishing.")
+            kind = action["action"]
+
         print(f"\n[{step}] playbook -> {describe_action(action, target)}")
 
         if kind == "nmap":
@@ -845,9 +931,29 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
                     # A reuse "hit" confirms a known login also opens this service.
                     print(f"    [+] reuse worked on {svc}: {pair['user']} / {pair['password']}")
 
+        elif kind == "enum":
+            port = action["port"]
+            print(f"    > enum (nmap vuln scripts) on port {port}")
+            output = run_enum(target, port, scope_file)
+            state["enum_done"].add(port)
+            if output is None:
+                print("    [!] enum refused: target not in scope")
+            else:
+                script_lines = [l.rstrip() for l in output.splitlines()
+                                if l.strip().startswith("|")]
+                summary = "\n".join(script_lines)[:4000]
+                if summary:
+                    enum_findings.append(f"Port {port}:\n{summary}")
+                    print(f"    > enum complete on {port} ({len(script_lines)} script line(s))")
+                else:
+                    print(f"    > enum on {port}: no vuln-script findings")
+
         elif kind == "finish":
             services = parse_services(state["scan"]) if state["scan"] else []
-            findings = "Deterministic playbook run (--fast, no LLM)."
+            findings = ("Hybrid playbook run (deterministic + LLM fallback on the unknown)."
+                        if hybrid else "Deterministic playbook run (--fast, no LLM).")
+            if enum_findings:
+                findings += "\n\n### LLM-fallback enumeration\n```\n" + "\n\n".join(enum_findings) + "\n```"
             credentials = [f"{p['service']} {p['user']} / {p['password']}"
                            for p in state["cred_pairs"]]
             report = build_report(target, services, exploits, postexploit, findings,
@@ -936,13 +1042,20 @@ def main():
                         help="validate or redirect each action before it runs (interactive only)")
     parser.add_argument("--fast", action="store_true",
                         help="run the deterministic playbook only (no LLM, no Ollama needed)")
+    parser.add_argument("--hybrid", action="store_true",
+                        help="run the deterministic playbook but fall back to the LLM "
+                             "only when it runs out of known moves (needs Ollama; "
+                             "combine with --guided to confirm each LLM suggestion)")
     parser.add_argument("--wordlist", choices=wordlists.LEVELS, default="builtin",
                         help="credential wordlist level: builtin (small/fast lab default), "
                              "common (John's list), rockyou (capped top-%d for hydra, full for john)"
                              % wordlists.HYDRA_MAX_PASSWORDS)
     args = parser.parse_args()
 
-    problems = preflight(args.host, args.scope, need_llm=not args.fast)
+    # The LLM is needed for the LLM-first default and for the hybrid fallback,
+    # but not for a pure --fast run.
+    need_llm = (not args.fast and not args.hybrid) or args.hybrid
+    problems = preflight(args.host, args.scope, need_llm=need_llm)
     if problems:
         for p in problems:
             print(f"[!] {p}", file=sys.stderr)
@@ -963,8 +1076,10 @@ def main():
     sys.stdout, sys.stderr = _Tee(orig_out, transcript_fh), _Tee(orig_err, transcript_fh)
     start = time.monotonic()
     try:
-        if args.fast:
-            run_fast(args.scope, args.target, args.max_steps, args.exploit, interactive, args.shell)
+        if args.fast or args.hybrid:
+            run_fast(args.scope, args.target, args.max_steps, args.exploit, interactive,
+                     args.shell, hybrid=args.hybrid, llm_host=args.host,
+                     llm_model=args.model, think=args.think, guided=args.guided)
         else:
             run_mission(args.host, args.model, args.scope, args.target, args.max_steps, args.exploit, interactive, args.think, args.shell, args.guided)
         print(f"[*] total time: {time.monotonic() - start:.1f}s")
