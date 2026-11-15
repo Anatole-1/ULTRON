@@ -17,6 +17,7 @@ import requests
 
 from nmap_tool import run_nmap
 from enum_tool import run_enum, run_smb_enum
+from nxc_tool import nxc_smb_spray, nxc_smb_shares
 from hydra_tool import run_hydra, run_hydra_combo
 from exploit_tool import MODULES
 from postexploit_tool import run_postexploit, parse_collection, POST_COMMANDS, interactive_exploit
@@ -219,18 +220,22 @@ def build_postexploit_section(collected):
 
 
 def build_report(target, services, exploits, postexploit, findings, credentials=None,
-                 enumeration=None):
+                 enumeration=None, smb_findings=None):
     service_lines = "\n".join(f"- {s}" for s in services) if services else "- (no nmap scan completed)"
     exploit_lines = "\n".join(f"- {e}" for e in exploits) if exploits else "- (none attempted)"
     cred_lines = "\n".join(f"- {c}" for c in credentials) if credentials else "- (none found)"
     enum_section = ""
     if enumeration:
         enum_section = f"## SMB / Windows enumeration\n```\n{enumeration}\n```\n\n"
+    smb_section = ""
+    if smb_findings:
+        smb_section = f"## SMB credential attack\n{smb_findings}\n\n"
     return (
         f"# Pentest report - {target}\n\n"
         f"_Generated {datetime.now():%Y-%m-%d %H:%M}_\n\n"
         f"## Open services\n{service_lines}\n\n"
         f"{enum_section}"
+        f"{smb_section}"
         f"## Exploitation\n{exploit_lines}\n\n"
         f"## Credentials\n{cred_lines}\n\n"
         f"## Post-exploitation\n{build_postexploit_section(postexploit)}\n\n"
@@ -350,6 +355,8 @@ def describe_action(action, target):
         return "finish (write the report)"
     if kind == "smb_enum":
         return f"smb_enum {target} (Windows/SMB NSE: os-discovery, signing, shares, sessions, vuln)"
+    if kind == "nxc_spray":
+        return f"nxc_spray {target} (SMB credential spray: defaults/weak passwords, local auth)"
     if kind in TOOLS:
         extras = " ".join(as_text(action.get(p)) for p in TOOLS[kind]["extra_params"])
         return f"{kind} {target} {extras}".strip()
@@ -616,6 +623,13 @@ def decide_next(state):
     if smb_open(services) and not state.get("smb_enum_done"):
         return {"action": "smb_enum", "target": target}
 
+    # Windows credential attack: once SMB is enumerated, spray default/weak
+    # credentials over SMB. Gated on exploit_enabled (it is an active login
+    # attack), and only while we have no admin creds / shell yet.
+    if (state["exploit_enabled"] and smb_open(services)
+            and not state.get("nxc_spray_done") and not state.get("shell_opened")):
+        return {"action": "nxc_spray", "target": target}
+
     # Exploit only while we have no shell yet: once root is obtained we stop
     # launching modules (this also avoids back-to-back exploits the VM dislikes).
     if state["exploit_enabled"] and not state["shell_opened"]:
@@ -654,10 +668,12 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
         "cred_pairs": [],
         "shell_opened": False,
         "smb_enum_done": False,
+        "nxc_spray_done": False,
     }
     exploits = []
     postexploit = {}
     smb_enum_text = None
+    smb_creds_text = None
 
     # The deterministic playbook never loops on the LLM, so its steps are free;
     # give it enough headroom to finish a busy box (nmap + smb_enum + hydra/reuse
@@ -685,6 +701,39 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
             else:
                 smb_enum_text = summarize_smb_enum(output) or "(no SMB script output)"
                 print(f"    > SMB enumeration complete ({len(smb_enum_text.splitlines())} line(s))")
+
+        elif kind == "nxc_spray":
+            print("    > spraying default/weak SMB credentials (nxc, local auth)")
+            output, creds = nxc_smb_spray(target, scope_file)
+            state["nxc_spray_done"] = True
+            if output is None:
+                print("    [!] nxc spray refused: target not in scope")
+            elif not creds:
+                print("    [-] no valid SMB credentials found")
+                smb_creds_text = "No valid credentials found by the spray."
+            else:
+                lines = []
+                admin_cred = None
+                for c in creds:
+                    tag = " (LOCAL ADMIN)" if c["admin"] else ""
+                    print(f"    [+] valid SMB login: {c['user']} / {c['password']}{tag}")
+                    add_cred_pair(state["cred_pairs"], "smb", c["user"], c["password"])
+                    lines.append(f"- {c['user']} / {c['password']}{tag}")
+                    if c["admin"] and admin_cred is None:
+                        admin_cred = c
+                # With an admin credential, list the reachable shares as read-only
+                # evidence of impact (no files are read or modified).
+                if admin_cred:
+                    sh = nxc_smb_shares(target, scope_file, admin_cred["user"], admin_cred["password"])
+                    share_lines = [l.split("445", 1)[-1].strip()
+                                   for l in (sh or "").splitlines()
+                                   if any(k in l for k in ("Share", "READ", "WRITE"))]
+                    if share_lines:
+                        lines.append("")
+                        lines.append(f"Shares reachable as {admin_cred['user']}:")
+                        lines.extend(f"  {s}" for s in share_lines)
+                        print(f"    [+] {admin_cred['user']} can reach {len(share_lines)-1} share(s)")
+                smb_creds_text = "\n".join(lines)
 
         elif kind == "exploit":
             module_key = action["module"]
@@ -746,7 +795,8 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
             credentials = [f"{p['service']} {p['user']} / {p['password']}"
                            for p in state["cred_pairs"]]
             report = build_report(target, services, exploits, postexploit, findings,
-                                   credentials, enumeration=smb_enum_text)
+                                   credentials, enumeration=smb_enum_text,
+                                   smb_findings=smb_creds_text)
             print("\n" + report)
             print(f"[*] report saved to {save_report(target, report)}")
             return
