@@ -51,7 +51,7 @@ def nxc_smb_info(target, scope_file):
 
 
 # A successful nxc SMB login line looks like:
-#   SMB  192.168.1.220  445  WIN-LAB-VULN  [+] WIN-LAB-VULN\Administrator:vagrant (Pwn3d!)
+#   SMB  10.0.0.10  445  HOST  [+] HOST\Administrator:password (Pwn3d!)
 _CRED_RE = re.compile(r"\[\+\]\s+\S+?\\([^:]+):(.*?)(?:\s+\((Pwn3d!)\))?\s*$")
 
 

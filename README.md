@@ -61,6 +61,12 @@ commande (le modèle ne peut pas la changer).
 - **Exploitation** (off par défaut, `--exploit`) : allow-list de modules Metasploit
   vérifiés (vsftpd 2.3.4, Samba usermap 3.x, ProFTPD 1.3.3c, Samba trans2open 2.2.x),
   scope revérifié, `LHOST` auto, déclencheur par module.
+- **Cibles Windows (SMB)** : énumération SMB Windows-aware (NSE : OS, signature,
+  partages, `ms17-010`) ; **spray de credentials** (`nxc`/netexec, defaults faibles,
+  `--local-auth`) avec repérage des comptes admin et des partages ; **exécution
+  authentifiée** (collecte read-only + shell **SYSTEM** via psexec) ; et **MS17-010**
+  comme voie d'accès **sans credentials** (famille EternalBlue, SYSTEM, via named
+  pipe — pas de shellcode kernel).
 - **Post-exploitation** : une fois root, collecte **en lecture seule** (identité,
   comptes, hashes, réseau). Jamais de persistance, destruction ou exfiltration.
 - **Capture de session** : en plus du rapport, chaque run écrit un transcript
@@ -81,6 +87,11 @@ commande (le modèle ne peut pas la changer).
   de credentials** sur les autres services via `hydra -C` → rapport), **sans LLM ni
   serveur IA**. Les mots de passe connus incluent ceux **cassés localement** depuis
   les hashes `/etc/shadow` collectés (john), au-delà de la wordlist hydra.
+- **Mode hybride** (`--hybrid`) : le playbook déterministe pilote et n'appelle le
+  LLM **que lorsqu'il n'a plus de coup connu** (service inconnu) — pour UNE action
+  de l'allow-list (enum/exploit/hydra), validée (port ouvert, pas déjà fait, scope),
+  et confirmable via `--guided`. Vitesse du déterministe + couverture du LLM.
+  `--fast` reste 100% déterministe.
 - **Human-in-the-loop** : approbation avant exploit, indice si l'agent bloque.
   `-y` = autonome sans question. Non destructif et scope-gated de bout en bout.
 
@@ -114,6 +125,12 @@ change it).
 - **Exploitation** (off by default, `--exploit`): allow-listed Metasploit modules
   (vsftpd 2.3.4, Samba usermap 3.x, ProFTPD 1.3.3c, Samba trans2open 2.2.x),
   re-checked scope, auto-detected `LHOST`, per-module trigger.
+- **Windows (SMB) targets**: Windows-aware SMB enumeration (NSE: OS, signing,
+  shares, `ms17-010`); **credential spraying** (`nxc`/netexec, weak defaults,
+  `--local-auth`) flagging admin logins and reachable shares; **authenticated
+  execution** (read-only collection + a **SYSTEM** shell via psexec); and
+  **MS17-010** as a **credential-less** way in (EternalBlue family, SYSTEM, over a
+  named pipe — no kernel shellcode).
 - **Post-exploitation**: once root, **read-only** collection (identity, accounts,
   hashes, network). No persistence, destruction, or exfiltration.
 - **Session transcript**: besides the report, every run writes a timestamped log
@@ -134,6 +151,11 @@ change it).
   across the other services via `hydra -C` → report), with **no LLM and no AI
   server**. Known passwords include ones **cracked locally** from the collected
   `/etc/shadow` hashes (john), beyond hydra's wordlist.
+- **Hybrid mode** (`--hybrid`): the deterministic playbook drives and calls the LLM
+  **only when it runs out of known moves** (an unknown service) — for ONE
+  allow-listed action (enum/exploit/hydra), validated (open port, not already done,
+  in scope) and confirmable via `--guided`. Deterministic speed + LLM coverage;
+  `--fast` stays 100% deterministic.
 - **Human-in-the-loop**: approval before exploits, a hint when the agent is stuck.
   `-y` runs unattended. Non-destructive and scope-gated throughout.
 
@@ -152,7 +174,12 @@ python3 agent.py <target-ip> --host http://<ai-server-ip>:11434 --exploit --shel
 python3 agent.py <target-ip> --host http://<ai-server-ip>:11434 --exploit --guided  # you steer every action
 python3 agent.py <target-ip> --host http://<ai-server-ip>:11434 --exploit -y    # unattended, no prompts
 python3 agent.py <target-ip> --fast --exploit                                   # deterministic playbook only (no LLM / no AI server)
+python3 agent.py <target-ip> --fast --exploit --shell                           # + an interactive root/SYSTEM shell
+python3 agent.py <target-ip> --hybrid --exploit --host http://<ai-server-ip>:11434   # deterministic + LLM fallback on the unknown
 ```
+
+Full step-by-step guide: **[MANUAL.md](MANUAL.md)** (English) · **[MANUAL.fr.md](MANUAL.fr.md)** (Français).
+Vulnerable VMs used to validate ULTRON: **[TESTED_TARGETS.md](TESTED_TARGETS.md)**.
 
 `scope.txt` and generated reports stay local (git-ignored). Each run prints its
 total time; adding a tool is a single entry in the `TOOLS` registry.
@@ -168,6 +195,8 @@ total time; adding a tool is a single entry in the `TOOLS` registry.
 | `--shell`            | Hand a Meterpreter root shell after a successful exploit (interactive) · shell root après exploit. |
 | `--guided`           | Validate or redirect each action before it runs (interactive) · valider/rediriger chaque action. |
 | `--fast`             | Deterministic playbook only, no LLM / no AI server · playbook déterministe, sans LLM. |
+| `--hybrid`           | Playbook + LLM fallback only on the unknown (needs Ollama) · playbook + secours LLM sur l'inconnu. |
+| `--wordlist`         | Credential list level: `builtin`/`common`/`rockyou` · niveau de wordlist. |
 | `-y`, `--yes`        | Auto-approve, no prompts · tout approuver, sans question. |
 | `--think`            | Enable model reasoning (slower) · active le raisonnement (plus lent). |
 
@@ -186,21 +215,26 @@ The server address is never hard-coded (read from `--host` / `OLLAMA_HOST`).
 |------|----------------|
 | `agent.py`            | Orchestrator + ReAct loop, deterministic playbook (`--fast`), tool registry, guided mode, report builder. |
 | `nmap_tool.py`        | Recon: scope-checked `nmap -Pn -sV` scan (host discovery off, so ICMP-filtered targets aren't skipped). |
-| `enum_tool.py`        | Per-port enumeration: nmap vulnerability scripts (`-Pn`). |
+| `enum_tool.py`        | Per-port enumeration (nmap vuln scripts) + Windows-aware SMB enumeration (`run_smb_enum`). |
 | `hydra_tool.py`       | Credential attack: scope-checked hydra, wordlist level from `wordlists.py`. |
+| `nxc_tool.py`         | Windows SMB credential attacks (spray), authenticated execution and read-only collection via `nxc`/netexec. |
 | `wordlists.py`        | Named wordlist levels (builtin/common/rockyou), shared by hydra and john; bounded + cached. |
-| `exploit_tool.py`     | Exploitation: scope-checked, allow-listed Metasploit modules. |
-| `postexploit_tool.py` | Non-destructive post-exploitation + Meterpreter shell handoff. |
+| `exploit_tool.py`     | Exploitation: scope-checked, allow-listed Metasploit modules (Linux + Windows MS17-010). |
+| `postexploit_tool.py` | Non-destructive post-exploitation + robust interactive shell handoff (Linux raw/Meterpreter, Windows SYSTEM). |
 | `crack_tool.py`       | Local password cracking (john) on collected hashes, to feed credential reuse. |
 | `scope.py`            | The central safeguard: is a target in scope? |
 | `scope.txt.example`   | Template scope file (copy to `scope.txt`). |
 | `requirements.txt`    | Python dependencies (`requests`). |
+| `MANUAL.md` · `MANUAL.fr.md` | Full bilingual user manual (EN/FR). |
+| `TESTED_TARGETS.md`   | The validation lab: vulnerable VMs used to test ULTRON. |
 | `BENCHMARK.md`        | Model comparison (why `qwen3:8b`). |
 
 ## Requirements · Prérequis
 
-- Python 3 + `requests` · nmap + hydra + metasploit-framework (control host, preinstalled on Kali)
-- A reachable Ollama server with the model pulled (`ollama pull qwen3:8b`)
+- Python 3 + `requests` · nmap + hydra + john + metasploit-framework + netexec
+  (`nxc`, for Windows/SMB) — all preinstalled on Kali
+- (LLM / `--hybrid` modes only) a reachable Ollama server with the model pulled
+  (`ollama pull qwen3:8b`); not needed for `--fast`
 
 ## Roadmap
 
@@ -215,10 +249,13 @@ The server address is never hard-coded (read from `--host` / `OLLAMA_HOST`).
 - [x] Human-in-the-loop, run timing, analysis CVE-scrubbing
 - [x] Deterministic playbook + fast mode (`--fast`), no LLM, with credential reuse
 - [x] Local hash cracking (john) on collected `/etc/shadow`, feeding credential reuse
-- [ ] LLM fallback only on unknown service/version (hybrid playbook + model)
+- [x] LLM fallback only on unknown service/version (hybrid playbook + model, `--hybrid`)
 - [x] More exploit modules and lab targets: ProFTPD 1.3.3c + Samba trans2open
   modules, validated with root shells on VulnHub Basic Pentesting 1 & Kioptrix 1
 - [x] Larger wordlists for credential attacks (`--wordlist common|rockyou`, bounded + cached)
+- [x] Windows generalization: SMB enumeration, credential spraying (`nxc`),
+  authenticated execution + SYSTEM shell, and credential-less MS17-010
+- [x] Bilingual user manual + documented validation lab
 
 ## Inspirations · License
 
