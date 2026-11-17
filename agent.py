@@ -22,8 +22,8 @@ from nxc_tool import (nxc_smb_spray, nxc_smb_shares, windows_collection,
 from hydra_tool import run_hydra, run_hydra_combo
 from exploit_tool import MODULES, WINDOWS_MODULES
 from postexploit_tool import (run_postexploit, parse_collection, POST_COMMANDS,
-                              interactive_exploit, interactive_exploit_windows,
-                              run_windows_exploit, interactive_windows_exploit)
+                              interactive_exploit, interactive_windows_psexec,
+                              run_windows_exploit, interactive_windows_module)
 from crack_tool import crack_hashes
 import wordlists
 
@@ -268,18 +268,33 @@ def ask_llm(host, model, messages, think=True):
     return {"action": "error", "thought": error}
 
 
-def preflight(host, scope_file, need_llm=True):
-    problems = []
+def preflight(host, scope_file, need_llm=True, exploit_enabled=False):
+    """Check the environment before a run. Returns (problems, warnings):
+    problems are blocking (the run would fail without them); warnings flag a
+    missing optional tool whose step will simply be skipped. Catching these up
+    front beats failing mid-run with a cryptic error."""
+    problems, warnings = [], []
+    # Blocking: nmap (always), scope file, msfconsole (only when exploiting),
+    # and the LLM server (only when a mode needs it).
     if shutil.which("nmap") is None:
         problems.append("nmap is not installed or not on PATH.")
     if not os.path.exists(scope_file):
         problems.append(f"scope file not found: {scope_file} (copy scope.txt.example to scope.txt).")
+    if exploit_enabled and shutil.which("msfconsole") is None:
+        problems.append("msfconsole (Metasploit) is required for --exploit/--shell but was not found.")
     if need_llm:
         try:
             requests.get(f"{host}/api/tags", timeout=5).raise_for_status()
         except requests.exceptions.RequestException:
             problems.append(f"cannot reach the Ollama server at {host} (is it running?).")
-    return problems
+    # Non-blocking: the run still works, the matching step just degrades/skips.
+    for tool, used_for in (("hydra", "credential brute-forcing"),
+                           ("john", "offline hash cracking"),
+                           ("unshadow", "offline hash cracking"),
+                           ("nxc", "Windows SMB credential attacks / execution")):
+        if shutil.which(tool) is None:
+            warnings.append(f"{tool} not found — {used_for} will be skipped.")
+    return problems, warnings
 
 
 def run_tool(kind, action, target, scope_file, done, messages):
@@ -827,7 +842,7 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
                         print(f"    [+] collected {len(collected)} item(s): {', '.join(collected)}")
                     if shell_enabled and interactive:
                         print("    > opening interactive SYSTEM shell (msf)...")
-                        interactive_windows_exploit(target, module_key, scope_file)
+                        interactive_windows_module(target, module_key, scope_file)
                 else:
                     print("    [-] no session (exploit did not land)")
 
@@ -873,8 +888,8 @@ def run_fast(scope_file, target, max_steps, exploit_enabled, interactive, shell_
                         print(f"    [+] code execution confirmed; collected {len(col)} item(s): {', '.join(col)}")
                     if shell_enabled and interactive:
                         print("    > opening interactive Windows admin shell (msf psexec)...")
-                        interactive_exploit_windows(target, scope_file,
-                                                    admin_cred["user"], admin_cred["password"])
+                        interactive_windows_psexec(target, scope_file,
+                                                   admin_cred["user"], admin_cred["password"])
                 smb_creds_text = "\n".join(lines)
 
         elif kind == "exploit":
@@ -1055,7 +1070,10 @@ def main():
     # The LLM is needed for the LLM-first default and for the hybrid fallback,
     # but not for a pure --fast run.
     need_llm = (not args.fast and not args.hybrid) or args.hybrid
-    problems = preflight(args.host, args.scope, need_llm=need_llm)
+    problems, warnings = preflight(args.host, args.scope, need_llm=need_llm,
+                                   exploit_enabled=args.exploit)
+    for w in warnings:
+        print(f"[!] {w}", file=sys.stderr)
     if problems:
         for p in problems:
             print(f"[!] {p}", file=sys.stderr)
